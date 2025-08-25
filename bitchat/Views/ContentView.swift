@@ -25,28 +25,7 @@ struct PeerDisplayData: Identifiable {
     let isMutualFavorite: Bool
 }
 
-// MARK: - Lazy Link Preview
-
-// Lazy loading wrapper for link previews
-struct LazyLinkPreviewView: View {
-    let url: URL
-    let title: String?
-    @State private var isVisible = false
-    
-    var body: some View {
-        Group {
-            if isVisible {
-                LinkPreviewView(url: url, title: title)
-            } else {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color.gray.opacity(0.1))
-                    .frame(height: 80)
-            }
-        }
-        .frame(height: 80)
-        .onAppear { isVisible = true }
-    }
-}
+// (Link previews removed; URLs are now clickable inline)
 
 // MARK: - Main Content View
 
@@ -79,6 +58,7 @@ struct ContentView: View {
     @State private var scrollThrottleTimer: Timer?
     @State private var autocompleteDebounceTimer: Timer?
     @State private var showLocationChannelsSheet = false
+    @State private var showVerifySheet = false
     @State private var expandedMessageIDs: Set<String> = []
     // Window sizes for rendering (infinite scroll up)
     @State private var windowCountPublic: Int = 300
@@ -105,6 +85,10 @@ struct ContentView: View {
             ZStack {
                 // Base layer - Main public chat (always visible)
                 mainChatView
+                    .onAppear { viewModel.currentColorScheme = colorScheme }
+                    .onChange(of: colorScheme) { newValue in
+                        viewModel.currentColorScheme = newValue
+                    }
                 
                 // Private chat slide-over
                 if viewModel.selectedPrivateChatPeer != nil {
@@ -214,7 +198,7 @@ struct ContentView: View {
                 }
             }
 
-            Button("private message") {
+            Button("direct message") {
                 if let peerID = selectedMessageSenderID {
                     #if os(iOS)
                     if peerID.hasPrefix("nostr:") {
@@ -308,13 +292,17 @@ struct ContentView: View {
                     // Build stable UI IDs with a context key to avoid ID collisions when switching channels
                     #if os(iOS)
                     let contextKey: String = {
+                        if let peer = privatePeer { return "dm:\(peer)" }
                         switch locationManager.selectedChannel {
                         case .mesh: return "mesh"
                         case .location(let ch): return "geo:\(ch.geohash)"
                         }
                     }()
                     #else
-                    let contextKey: String = "mesh"
+                    let contextKey: String = {
+                        if let peer = privatePeer { return "dm:\(peer)" }
+                        return "mesh"
+                    }()
                     #endif
                     let items = windowedMessages.map { (uiID: "\(contextKey)|\($0.id)", message: $0) }
                     
@@ -331,9 +319,11 @@ struct ContentView: View {
                             } else {
                                 // Regular messages with natural text wrapping
                                 VStack(alignment: .leading, spacing: 0) {
+                                    // Precompute heavy token scans once per row
+                                    let cashuTokens = message.content.extractCashuTokens()
+                                    let lightningLinks = message.content.extractLightningLinks()
                                     HStack(alignment: .top, spacing: 0) {
-                                        // Single text view for natural wrapping
-                                        let isLong = message.content.count > 2000 || message.content.hasVeryLongToken(threshold: 512)
+                                        let isLong = (message.content.count > 2000 || message.content.hasVeryLongToken(threshold: 512)) && cashuTokens.isEmpty
                                         let isExpanded = expandedMessageIDs.contains(message.id)
                                         Text(viewModel.formatMessageAsText(message, colorScheme: colorScheme))
                                             .fixedSize(horizontal: false, vertical: true)
@@ -349,9 +339,9 @@ struct ContentView: View {
                                     }
                                     
                                     // Expand/Collapse for very long messages
-                                    if (message.content.count > 2000 || message.content.hasVeryLongToken(threshold: 512)) {
+                                    if (message.content.count > 2000 || message.content.hasVeryLongToken(threshold: 512)) && cashuTokens.isEmpty {
                                         let isExpanded = expandedMessageIDs.contains(message.id)
-                                        Button(isExpanded ? "Show less" : "Show more") {
+                                        Button(isExpanded ? "show less" : "show more") {
                                             if isExpanded { expandedMessageIDs.remove(message.id) }
                                             else { expandedMessageIDs.insert(message.id) }
                                         }
@@ -360,21 +350,7 @@ struct ContentView: View {
                                         .padding(.top, 4)
                                     }
 
-                                    // Check for plain URLs
-                                    let urls = message.content.extractURLs()
-                                    if !urls.isEmpty {
-                                        ForEach(urls.prefix(2).indices, id: \.self) { index in
-                                            let urlInfo = urls[index]
-                                            LazyLinkPreviewView(url: urlInfo.url, title: nil)
-                                                .padding(.top, 3)
-                                                .padding(.horizontal, 1)
-                                                .id("\(message.id)-\(urlInfo.url.absoluteString)")
-                                        }
-                                    }
-
                                     // Render payment chips (Lightning / Cashu) with rounded background
-                                    let lightningLinks = message.content.extractLightningLinks()
-                                    let cashuTokens = message.content.extractCashuTokens()
                                     if !lightningLinks.isEmpty || !cashuTokens.isEmpty {
                                         HStack(spacing: 8) {
                                             ForEach(Array(lightningLinks.prefix(3)).indices, id: \.self) { i in
@@ -425,13 +401,17 @@ struct ContentView: View {
                                 let step = 200
                                 #if os(iOS)
                                 let contextKey: String = {
+                                    if let peer = privatePeer { return "dm:\(peer)" }
                                     switch locationManager.selectedChannel {
                                     case .mesh: return "mesh"
                                     case .location(let ch): return "geo:\(ch.geohash)"
                                     }
                                 }()
                                 #else
-                                let contextKey: String = "mesh"
+                                let contextKey: String = {
+                                    if let peer = privatePeer { return "dm:\(peer)" }
+                                    return "mesh"
+                                }()
                                 #endif
                                 let preserveID = "\(contextKey)|\(message.id)"
                                 if let peer = privatePeer {
@@ -462,11 +442,11 @@ struct ContentView: View {
                         }
                         .contentShape(Rectangle())
                         .onTapGesture {
-                            // Only show actions for messages from other users (not system or self)
-                            if message.sender != "system" && message.sender != viewModel.nickname {
-                                selectedMessageSender = message.sender
-                                selectedMessageSenderID = message.senderPeerID
-                                showMessageActions = true
+                            // Tap on message body: insert @mention for this sender
+                            if message.sender != "system" {
+                                let name = message.sender
+                                messageText = "@\(name) "
+                                isTextFieldFocused = true
                             }
                         }
                         .contextMenu {
@@ -484,9 +464,40 @@ struct ContentView: View {
                         .padding(.vertical, 2)
                     }
                 }
+                .transaction { tx in if viewModel.isBatchingPublic { tx.disablesAnimations = true } }
                 .padding(.vertical, 4)
             }
             .background(backgroundColor)
+            .onOpenURL { url in
+                guard url.scheme == "bitchat", url.host == "user" else { return }
+                let id = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let peerID = id.removingPercentEncoding ?? id
+                selectedMessageSenderID = peerID
+                selectedMessageSender = viewModel.messages.last(where: { $0.senderPeerID == peerID })?.sender
+                showMessageActions = true
+            }
+            .onOpenURL { url in
+                guard url.scheme == "bitchat", url.host == "geohash" else { return }
+                let gh = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+                let allowed = Set("0123456789bcdefghjkmnpqrstuvwxyz")
+                guard (2...12).contains(gh.count), gh.allSatisfy({ allowed.contains($0) }) else { return }
+                #if os(iOS)
+                func levelForLength(_ len: Int) -> GeohashChannelLevel {
+                    switch len {
+                    case 0...2: return .region
+                    case 3...4: return .province
+                    case 5: return .city
+                    case 6: return .neighborhood
+                    case 7: return .block
+                    default: return .block
+                    }
+                }
+                let level = levelForLength(gh.count)
+                let ch = GeohashChannel(level: level, geohash: gh)
+                LocationChannelManager.shared.markTeleported(for: gh, true)
+                LocationChannelManager.shared.select(ChannelID.location(ch))
+                #endif
+            }
             .onTapGesture(count: 3) {
                 // Triple-tap to clear current chat
                 viewModel.sendMessage("/clear")
@@ -924,6 +935,24 @@ struct ContentView: View {
                         .font(.system(size: 16, weight: .bold, design: .monospaced))
                         .foregroundColor(textColor)
                     Spacer()
+                    // Show QR only on mesh channel's peer list
+                    #if os(iOS)
+                    if case .mesh = locationManager.selectedChannel {
+                        Button(action: { showVerifySheet = true }) {
+                            Image(systemName: "qrcode")
+                                .font(.system(size: 14))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Verification: show my QR or scan a friend")
+                    }
+                    #else
+                    Button(action: { showVerifySheet = true }) {
+                        Image(systemName: "qrcode")
+                            .font(.system(size: 14))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Verification: show my QR or scan a friend")
+                    #endif
                 }
                 .frame(height: 44) // Match header height
                 .padding(.horizontal, 12)
@@ -1214,12 +1243,18 @@ struct ContentView: View {
                         .accessibilityHidden(true)
                 }
                 .foregroundColor(headerCountColor)
+
+                // QR moved to the PEOPLE header in the sidebar when on mesh channel
             }
             .onTapGesture {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     showSidebar.toggle()
                     sidebarDragOffset = 0
                 }
+            }
+            .sheet(isPresented: $showVerifySheet) {
+                VerificationSheetView(isPresented: $showVerifySheet)
+                    .environmentObject(viewModel)
             }
         }
         .frame(height: 44)
