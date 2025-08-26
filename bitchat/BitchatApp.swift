@@ -99,30 +99,18 @@ struct BitchatApp: App {
             return
         }
         
-        // Only process if shared within last 30 seconds
-        if Date().timeIntervalSince(sharedDate) < 30 {
+        // Only process if shared within configured window
+        if Date().timeIntervalSince(sharedDate) < TransportConfig.uiShareAcceptWindowSeconds {
             let contentType = userDefaults.string(forKey: "sharedContentType") ?? "text"
             
             // Clear the shared content
             userDefaults.removeObject(forKey: "sharedContent")
             userDefaults.removeObject(forKey: "sharedContentType")
             userDefaults.removeObject(forKey: "sharedContentDate")
-            userDefaults.synchronize()
+            // No need to force synchronize here
             
-            // Show notification about shared content
+            // Send the shared content immediately on the main queue
             DispatchQueue.main.async {
-                // Add system message about sharing
-                let systemMessage = BitchatMessage(
-                    sender: "system",
-                    content: "preparing to share \(contentType)...",
-                    timestamp: Date(),
-                    isRelay: false
-                )
-                self.chatViewModel.messages.append(systemMessage)
-            }
-            
-            // Send the shared content after a short delay
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 if contentType == "url" {
                     // Try to parse as JSON first
                     if let data = sharedContent.data(using: .utf8),
