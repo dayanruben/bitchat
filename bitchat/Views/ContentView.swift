@@ -24,6 +24,7 @@ struct ContentView: View {
     
     @EnvironmentObject var viewModel: ChatViewModel
     @ObservedObject private var locationManager = LocationChannelManager.shared
+    @ObservedObject private var bookmarks = GeohashBookmarksStore.shared
     @State private var messageText = ""
     @State private var textFieldSelection: NSRange? = nil
     @FocusState private var isTextFieldFocused: Bool
@@ -164,6 +165,8 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showAppInfo) {
             AppInfoView()
+                .onAppear { viewModel.isAppInfoPresented = true }
+                .onDisappear { viewModel.isAppInfoPresented = false }
         }
         .sheet(isPresented: Binding(
             get: { viewModel.showingFingerprintFor != nil },
@@ -278,8 +281,10 @@ struct ContentView: View {
                         }
                     }()
                     let items = windowedMessages.map { (uiID: "\(contextKey)|\($0.id)", message: $0) }
-                    
-                    ForEach(items, id: \.uiID) { item in
+                    // Filter out empty/whitespace-only messages to avoid blank rows
+                    let filteredItems = items.filter { !$0.message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+                    ForEach(filteredItems, id: \.uiID) { item in
                         let message = item.message
                         VStack(alignment: .leading, spacing: 0) {
                             // Check if current user is mentioned
@@ -1118,6 +1123,15 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel("Open unread private chat")
                 }
+                // Bookmark toggle for current geohash (not shown for mesh)
+                if case .location(let ch) = locationManager.selectedChannel {
+                    Button(action: { GeohashBookmarksStore.shared.toggle(ch.geohash) }) {
+                        Image(systemName: GeohashBookmarksStore.shared.isBookmarked(ch.geohash) ? "bookmark.fill" : "bookmark")
+                            .font(.system(size: 12))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Toggle bookmark for #\(ch.geohash)")
+                }
                 // Location channels button '#'
                 Button(action: { showLocationChannelsSheet = true }) {
                     let badgeText: String = {
@@ -1172,6 +1186,13 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .sheet(isPresented: $showLocationChannelsSheet) {
             LocationChannelsSheet(isPresented: $showLocationChannelsSheet)
+                .onAppear { viewModel.isLocationChannelsSheetPresented = true }
+                .onDisappear { viewModel.isLocationChannelsSheetPresented = false }
+        }
+        .alert("heads up", isPresented: $viewModel.showScreenshotPrivacyWarning) {
+            Button("ok", role: .cancel) {}
+        } message: {
+            Text("screenshots of location channels will reveal your location. think before sharing publicly.")
         }
         .background(backgroundColor.opacity(0.95))
     }

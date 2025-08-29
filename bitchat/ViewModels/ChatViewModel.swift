@@ -382,6 +382,11 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
     @Published var showBluetoothAlert = false
     @Published var bluetoothAlertMessage = ""
     @Published var bluetoothState: CBManagerState = .unknown
+
+    // Presentation state for privacy gating
+    @Published var isLocationChannelsSheetPresented: Bool = false
+    @Published var isAppInfoPresented: Bool = false
+    @Published var showScreenshotPrivacyWarning: Bool = false
     
     // Messages are naturally ephemeral - no persistent storage
     // Persist mesh public timeline across channel switches
@@ -586,6 +591,11 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
                         if connected {
                             Task { @MainActor in
                                 self.resubscribeCurrentGeohash()
+                                // Re-init sampling for regional + bookmarked geohashes after reconnect
+                                let regional = LocationChannelManager.shared.availableChannels.map { $0.geohash }
+                                let bookmarks = GeohashBookmarksStore.shared.bookmarks
+                                let union = Array(Set(regional).union(bookmarks))
+                                self.beginGeohashSampling(for: union)
                             }
                         }
                     }
@@ -611,21 +621,41 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
             self.switchLocationChannel(to: LocationChannelManager.shared.selectedChannel)
         }
 
-        // Background: keep sampling nearby geohashes for notifications even when sheet is closed
+        // Background: keep sampling nearby geohashes + bookmarks for notifications even when sheet is closed
         LocationChannelManager.shared.$availableChannels
             .receive(on: DispatchQueue.main)
             .sink { [weak self] channels in
                 guard let self = self else { return }
-                let ghs = channels.map { $0.geohash }
+                let regional = channels.map { $0.geohash }
+                let bookmarks = GeohashBookmarksStore.shared.bookmarks
+                let union = Array(Set(regional).union(bookmarks))
                 Task { @MainActor in
-                    self.beginGeohashSampling(for: ghs)
+                    self.beginGeohashSampling(for: union)
                 }
             }
             .store(in: &cancellables)
-        // Kick off initial sampling if we already have channels
-        if !LocationChannelManager.shared.availableChannels.isEmpty {
-            let ghs = LocationChannelManager.shared.availableChannels.map { $0.geohash }
-            Task { @MainActor in self.beginGeohashSampling(for: ghs) }
+
+        // Also observe bookmark changes to update sampling
+        GeohashBookmarksStore.shared.$bookmarks
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] bookmarks in
+                guard let self = self else { return }
+                let regional = LocationChannelManager.shared.availableChannels.map { $0.geohash }
+                let union = Array(Set(regional).union(bookmarks))
+                Task { @MainActor in
+                    self.beginGeohashSampling(for: union)
+                }
+            }
+            .store(in: &cancellables)
+
+        // Kick off initial sampling if we have regional channels or bookmarks
+        do {
+            let regional = LocationChannelManager.shared.availableChannels.map { $0.geohash }
+            let bookmarks = GeohashBookmarksStore.shared.bookmarks
+            let union = Array(Set(regional).union(bookmarks))
+            if !union.isEmpty {
+                Task { @MainActor in self.beginGeohashSampling(for: union) }
+            }
         }
         // Refresh channels once when authorized to seed sampling
         LocationChannelManager.shared.$permissionState
@@ -1382,6 +1412,11 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
         switch channel {
         case .mesh:
             messages = meshTimeline
+            // Debug: log if any empty messages are present
+            let emptyMesh = messages.filter { $0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+            if emptyMesh > 0 {
+                SecureLogger.log("RenderGuard: mesh timeline contains \(emptyMesh) empty messages", category: SecureLogger.session, level: .debug)
+            }
             stopGeoParticipantsTimer()
             geohashPeople = []
             teleportedGeo.removeAll()
@@ -1389,13 +1424,26 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
             // Sanitize existing timeline (filter any prior empty-content entries)
             var arr = geoTimelines[ch.geohash] ?? []
             arr.removeAll { $0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            // Ensure chronological order when returning to a geohash
+            // Deduplicate by ID while preserving order (from oldest to newest)
             if arr.count > 1 {
-                arr.sort { $0.timestamp < $1.timestamp }
+                var seen = Set<String>()
+                var dedup: [BitchatMessage] = []
+                for m in arr.sorted(by: { $0.timestamp < $1.timestamp }) {
+                    if !seen.contains(m.id) {
+                        dedup.append(m)
+                        seen.insert(m.id)
+                    }
+                }
+                arr = dedup
             }
             // Persist the cleaned/sorted timeline for this geohash
             geoTimelines[ch.geohash] = arr
             messages = arr
+            // Debug: log if any empty messages are present post-sanitize
+            let emptyGeo = messages.filter { $0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+            if emptyGeo > 0 {
+                SecureLogger.log("RenderGuard: geohash \(ch.geohash) timeline has \(emptyGeo) empty messages after sanitize", category: SecureLogger.session, level: .debug)
+            }
         }
         // Unsubscribe previous
         if let sub = geoSubscriptionID {
@@ -1838,7 +1886,6 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
                 let eventTime = Date(timeIntervalSince1970: TimeInterval(event.created_at))
                 if Date().timeIntervalSince(eventTime) > 30 { return }
                 // Foreground policy: allow if it's a different geohash than the one currently open
-                // Suppress only when app is active AND we're already in this same geohash channel
                 #if os(iOS)
                 if UIApplication.shared.applicationState == .active {
                     if case .location(let ch) = self.activeChannel, ch.geohash == gh { return }
@@ -1861,6 +1908,30 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
                 }()
                 Task { @MainActor in
                     self.lastGeoNotificationAt[gh] = now
+                    // Pre-populate the target geohash timeline so the triggering message appears when user opens it
+                    var arr = self.geoTimelines[gh] ?? []
+                    let senderSuffix = String(event.pubkey.suffix(4))
+                    let nick = self.geoNicknames[event.pubkey.lowercased()]
+                    let senderName = (nick?.isEmpty == false ? nick! : "anon") + "#" + senderSuffix
+                    let ts = Date(timeIntervalSince1970: TimeInterval(event.created_at))
+                    let mentions = self.parseMentions(from: content)
+                    let msg = BitchatMessage(
+                        id: event.id,
+                        sender: senderName,
+                        content: content,
+                        timestamp: ts,
+                        isRelay: false,
+                        originalSender: nil,
+                        isPrivate: false,
+                        recipientNickname: nil,
+                        senderPeerID: "nostr:\(event.pubkey.prefix(TransportConfig.nostrShortKeyDisplayLength))",
+                        mentions: mentions.isEmpty ? nil : mentions
+                    )
+                    if !arr.contains(where: { $0.id == msg.id }) {
+                        arr.append(msg)
+                        if arr.count > self.geoTimelineCap { arr = Array(arr.suffix(self.geoTimelineCap)) }
+                        self.geoTimelines[gh] = arr
+                    }
                     NotificationService.shared.sendGeohashActivityNotification(geohash: gh, bodyPreview: preview)
                 }
             }
@@ -2540,6 +2611,17 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
     
     @MainActor
     @objc private func userDidTakeScreenshot() {
+        // Respect privacy: do not broadcast screenshots taken from non-chat sheets
+        if isLocationChannelsSheetPresented {
+            // Show a warning about sharing location screenshots publicly
+            showScreenshotPrivacyWarning = true
+            return
+        }
+        if isAppInfoPresented {
+            // Silently ignore screenshots of app info
+            return
+        }
+
         // Send screenshot notification based on current context
         let screenshotMessage = "* \(nickname) took a screenshot *"
         
@@ -2559,7 +2641,7 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
                 }
             }
             
-            // Show local notification immediately as system message
+            // Show local notification immediately as system message (only in chat)
             let localNotification = BitchatMessage(
                 sender: "system",
                 content: "you took a screenshot",
@@ -2610,7 +2692,7 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
             }
             
 
-            // Show local notification immediately as system message
+            // Show local notification immediately as system message (only in chat)
             let localNotification = BitchatMessage(
                 sender: "system",
                 content: "you took a screenshot",
@@ -2995,8 +3077,10 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
         let mentionRegex = try? NSRegularExpression(pattern: mentionPattern, options: [])
         let hashtagRegex = try? NSRegularExpression(pattern: hashtagPattern, options: [])
         
-        let mentionMatches = mentionRegex?.matches(in: contentText, options: [], range: NSRange(location: 0, length: contentText.count)) ?? []
-        let hashtagMatches = hashtagRegex?.matches(in: contentText, options: [], range: NSRange(location: 0, length: contentText.count)) ?? []
+        let nsContent = contentText as NSString
+        let nsLen = nsContent.length
+        let mentionMatches = mentionRegex?.matches(in: contentText, options: [], range: NSRange(location: 0, length: nsLen)) ?? []
+        let hashtagMatches = hashtagRegex?.matches(in: contentText, options: [], range: NSRange(location: 0, length: nsLen)) ?? []
         
         // Combine and sort all matches
         var allMatches: [(range: NSRange, type: String)] = []
@@ -3013,12 +3097,14 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
         for (matchRange, matchType) in allMatches {
             // Add text before the match
             if let range = Range(matchRange, in: contentText) {
-                let beforeText = String(contentText[lastEndIndex..<range.lowerBound])
-                if !beforeText.isEmpty {
-                    var normalStyle = AttributeContainer()
-                    normalStyle.font = .system(size: 14, design: .monospaced)
-                    normalStyle.foregroundColor = isDark ? Color.white : Color.black
-                    processedContent.append(AttributedString(beforeText).mergingAttributes(normalStyle))
+                if lastEndIndex < range.lowerBound {
+                    let beforeText = String(contentText[lastEndIndex..<range.lowerBound])
+                    if !beforeText.isEmpty {
+                        var normalStyle = AttributeContainer()
+                        normalStyle.font = .system(size: 14, design: .monospaced)
+                        normalStyle.foregroundColor = isDark ? Color.white : Color.black
+                        processedContent.append(AttributedString(beforeText).mergingAttributes(normalStyle))
+                    }
                 }
                 
                 // Add the match with appropriate styling
@@ -3036,7 +3122,7 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
                 
                 processedContent.append(AttributedString(matchText).mergingAttributes(matchStyle))
                 
-                lastEndIndex = range.upperBound
+                if lastEndIndex < range.upperBound { lastEndIndex = range.upperBound }
             }
         }
         
@@ -3113,9 +3199,12 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
             
             // For extremely long content, render as plain text to avoid heavy regex/layout work,
             // unless the content includes Cashu tokens we want to chip-render below
+            // Compute NSString-backed length for regex/nsrange correctness with multi-byte characters
+            let nsContent = content as NSString
+            let nsLen = nsContent.length
             let containsCashuEarly: Bool = {
                 let rx = Regexes.quickCashuPresence
-                return rx.numberOfMatches(in: content, options: [], range: NSRange(location: 0, length: content.count)) > 0
+                return rx.numberOfMatches(in: content, options: [], range: NSRange(location: 0, length: nsLen)) > 0
             }()
             if (content.count > 4000 || content.hasVeryLongToken(threshold: 1024)) && !containsCashuEarly {
                 var plainStyle = AttributeContainer()
@@ -3133,8 +3222,6 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
             let lnurlRegex = Regexes.lnurl
             let lightningSchemeRegex = Regexes.lightningScheme
             let detector = Regexes.linkDetector
-            
-            let nsLen = content.count
             let hasMentionsHint = content.contains("@")
             let hasHashtagsHint = content.contains("#")
             let hasURLHint = content.contains("://") || content.contains("www.") || content.contains("http")
@@ -3214,17 +3301,19 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
             for (range, type) in allMatches {
                 // Add text before match
                 if let nsRange = Range(range, in: content) {
-                    let beforeText = String(content[lastEnd..<nsRange.lowerBound])
-                    if !beforeText.isEmpty {
-                        var beforeStyle = AttributeContainer()
-                        beforeStyle.foregroundColor = baseColor
-                        beforeStyle.font = isSelf
-                            ? .system(size: 14, weight: .bold, design: .monospaced)
-                            : .system(size: 14, design: .monospaced)
-                        if isMentioned {
-                            beforeStyle.font = beforeStyle.font?.bold()
+                    if lastEnd < nsRange.lowerBound {
+                        let beforeText = String(content[lastEnd..<nsRange.lowerBound])
+                        if !beforeText.isEmpty {
+                            var beforeStyle = AttributeContainer()
+                            beforeStyle.foregroundColor = baseColor
+                            beforeStyle.font = isSelf
+                                ? .system(size: 14, weight: .bold, design: .monospaced)
+                                : .system(size: 14, design: .monospaced)
+                            if isMentioned {
+                                beforeStyle.font = beforeStyle.font?.bold()
+                            }
+                            result.append(AttributedString(beforeText).mergingAttributes(beforeStyle))
                         }
-                        result.append(AttributedString(beforeText).mergingAttributes(beforeStyle))
                     }
                     
                     // Add styled match
@@ -3332,7 +3421,10 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
                             result.append(AttributedString(matchText).mergingAttributes(matchStyle))
                         }
                     }
-                    lastEnd = nsRange.upperBound
+                    // Advance lastEnd safely in case of overlaps
+                    if lastEnd < nsRange.upperBound {
+                        lastEnd = nsRange.upperBound
+                    }
                 }
             }
             
@@ -3430,19 +3522,23 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
             // Regular expression to find @mentions
             let pattern = "@([\\p{L}0-9_]+)"
             let regex = try? NSRegularExpression(pattern: pattern, options: [])
-            let matches = regex?.matches(in: contentText, options: [], range: NSRange(location: 0, length: contentText.count)) ?? []
+            let nsContent = contentText as NSString
+            let nsLen = nsContent.length
+            let matches = regex?.matches(in: contentText, options: [], range: NSRange(location: 0, length: nsLen)) ?? []
             
             var lastEndIndex = contentText.startIndex
             
             for match in matches {
                 // Add text before the mention
                 if let range = Range(match.range(at: 0), in: contentText) {
-                    let beforeText = String(contentText[lastEndIndex..<range.lowerBound])
-                    if !beforeText.isEmpty {
-                        var normalStyle = AttributeContainer()
-                        normalStyle.font = .system(size: 14, design: .monospaced)
-                        normalStyle.foregroundColor = isDark ? Color.white : Color.black
-                        processedContent.append(AttributedString(beforeText).mergingAttributes(normalStyle))
+                    if lastEndIndex < range.lowerBound {
+                        let beforeText = String(contentText[lastEndIndex..<range.lowerBound])
+                        if !beforeText.isEmpty {
+                            var normalStyle = AttributeContainer()
+                            normalStyle.font = .system(size: 14, design: .monospaced)
+                            normalStyle.foregroundColor = isDark ? Color.white : Color.black
+                            processedContent.append(AttributedString(beforeText).mergingAttributes(normalStyle))
+                        }
                     }
                     
                     // Add the mention with highlight
@@ -3452,7 +3548,7 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
                     mentionStyle.foregroundColor = Color.orange
                     processedContent.append(AttributedString(mentionText).mergingAttributes(mentionStyle))
                     
-                    lastEndIndex = range.upperBound
+                    if lastEndIndex < range.upperBound { lastEndIndex = range.upperBound }
                 }
             }
             
@@ -4529,14 +4625,10 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
                     self.meshService.isPeerConnected(peerID) || self.meshService.isPeerReachable(peerID)
                 }
                 
-                // Check if we have new mesh peers we haven't seen recently
+                // Rising-edge only: previously zero peers, now > 0 peers
                 let currentPeerSet = Set(meshPeers)
-                let newPeers = currentPeerSet.subtracting(self.recentlySeenPeers)
-                // Send notification if:
-                // 1. We have mesh peers (not just Nostr-only)
-                // 2. There are new peers we haven't seen (rising-edge)
-                // 3. We haven't already notified since the last sustained-empty period
-                if meshPeers.count > 0 && !newPeers.isEmpty && !self.hasNotifiedNetworkAvailable {
+                let hadNone = self.recentlySeenPeers.isEmpty
+                if meshPeers.count > 0 && hadNone && !self.hasNotifiedNetworkAvailable {
                     self.hasNotifiedNetworkAvailable = true
                     self.lastNetworkNotificationTime = Date()
                     self.recentlySeenPeers = currentPeerSet
@@ -4545,16 +4637,14 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
                                    category: SecureLogger.session, level: .info)
                 }
             } else {
-                // No peers - schedule a graceful reset to avoid refiring on brief drops
-                if self.networkResetTimer == nil {
-                    self.networkResetTimer = Timer.scheduledTimer(withTimeInterval: self.networkResetGraceSeconds, repeats: false) { [weak self] _ in
-                        guard let self = self else { return }
-                        self.hasNotifiedNetworkAvailable = false
-                        self.recentlySeenPeers.removeAll()
-                        self.networkResetTimer = nil
-                        SecureLogger.log("⏳ Mesh empty for \(Int(self.networkResetGraceSeconds))s — reset network notification state", category: SecureLogger.session, level: .debug)
-                    }
+                // No peers — immediately reset to allow next rising-edge to notify
+                self.hasNotifiedNetworkAvailable = false
+                self.recentlySeenPeers.removeAll()
+                if self.networkResetTimer != nil {
+                    self.networkResetTimer?.invalidate()
+                    self.networkResetTimer = nil
                 }
+                SecureLogger.log("⏳ Mesh empty — reset network notification state", category: SecureLogger.session, level: .debug)
             }
             
             // Register ephemeral sessions for all connected peers
@@ -4656,7 +4746,9 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
         // Allow optional disambiguation suffix '#abcd' for duplicate nicknames
         let pattern = "@([\\p{L}0-9_]+(?:#[a-fA-F0-9]{4})?)"
         let regex = try? NSRegularExpression(pattern: pattern, options: [])
-        let matches = regex?.matches(in: content, options: [], range: NSRange(location: 0, length: content.count)) ?? []
+        let nsContent = content as NSString
+        let nsLen = nsContent.length
+        let matches = regex?.matches(in: content, options: [], range: NSRange(location: 0, length: nsLen)) ?? []
         
         var mentions: [String] = []
         let peerNicknames = meshService.getPeerNicknames()
@@ -5723,9 +5815,12 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
         if isGeo && finalMessage.sender != "system" {
             if let gh = currentGeohash {
                 var arr = geoTimelines[gh] ?? []
-                arr.append(finalMessage)
-                if arr.count > geoTimelineCap { arr = Array(arr.suffix(geoTimelineCap)) }
-                geoTimelines[gh] = arr
+                // Dedup by message ID before appending to per-geohash timeline
+                if !arr.contains(where: { $0.id == finalMessage.id }) {
+                    arr.append(finalMessage)
+                    if arr.count > geoTimelineCap { arr = Array(arr.suffix(geoTimelineCap)) }
+                    geoTimelines[gh] = arr
+                }
             }
         }
 
@@ -5740,11 +5835,13 @@ class ChatViewModel: ObservableObject, BitchatDelegate {
 
         guard channelMatches else { return }
 
-        
+        // Removed background nudge notification for generic "new chats!"
 
-        // Append via batching buffer (skip empty content)
+        // Append via batching buffer (skip empty content) with simple dedup by ID
         if !finalMessage.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            enqueuePublic(finalMessage)
+            if !messages.contains(where: { $0.id == finalMessage.id }) {
+                enqueuePublic(finalMessage)
+            }
         }
     }
 
