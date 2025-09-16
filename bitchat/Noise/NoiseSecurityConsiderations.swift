@@ -6,6 +6,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import BitLogger
 import Foundation
 import CryptoKit
 
@@ -207,6 +208,15 @@ final class NoiseRateLimiter {
         queue.async(flags: .barrier) {
             self.handshakeTimestamps.removeValue(forKey: peerID)
             self.messageTimestamps.removeValue(forKey: peerID)
+        }
+    }
+
+    func resetAll() {
+        queue.async(flags: .barrier) {
+            self.handshakeTimestamps.removeAll()
+            self.messageTimestamps.removeAll()
+            self.globalHandshakeTimestamps.removeAll()
+            self.globalMessageTimestamps.removeAll()
         }
     }
 }

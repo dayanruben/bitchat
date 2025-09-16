@@ -6,6 +6,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import BitLogger
 import Foundation
 import CryptoKit
 
@@ -305,6 +306,15 @@ final class NoiseSessionManager {
                 session.reset()
             }
             _ = sessions.removeValue(forKey: peerID)
+        }
+    }
+
+    func removeAllSessions() {
+        managerQueue.sync(flags: .barrier) {
+            for (_, session) in sessions {
+                session.reset()
+            }
+            sessions.removeAll()
         }
     }
     
