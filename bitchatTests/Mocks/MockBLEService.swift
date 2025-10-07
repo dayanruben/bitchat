@@ -147,7 +147,7 @@ final class MockBLEService: NSObject {
             originalSender: nil,
             isPrivate: recipientID != nil,
             recipientNickname: nil,
-            senderPeerID: myPeerID,
+            senderPeerID: PeerID(str: myPeerID),
             mentions: mentions.isEmpty ? nil : mentions
         )
         
@@ -192,7 +192,7 @@ final class MockBLEService: NSObject {
             originalSender: nil,
             isPrivate: true,
             recipientNickname: recipientNickname,
-            senderPeerID: myPeerID,
+            senderPeerID: PeerID(str: myPeerID),
             mentions: nil
         )
         
@@ -349,3 +349,18 @@ final class MockBLEService: NSObject {
 
 // Backward compatibility for older tests
 typealias MockSimplifiedBluetoothService = MockBLEService
+
+// MARK: - Helpers
+
+extension MockBLEService {
+    convenience init(peerID: PeerID, nickname: String) {
+        self.init()
+        myPeerID = peerID.id
+        mockNickname = nickname
+    }
+
+    func simulateConnection(with otherPeer: MockBLEService) {
+        simulateConnectedPeer(otherPeer.myPeerID)
+        otherPeer.simulateConnectedPeer(myPeerID)
+    }
+}

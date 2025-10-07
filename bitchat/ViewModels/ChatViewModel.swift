@@ -323,7 +323,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
     func getShortIDForNoiseKey(_ fullNoiseKeyHex: String) -> String? {
         // Check known peers for a noise key match
         if let match = allPeers.first(where: { $0.noisePublicKey.hexEncodedString() == fullNoiseKeyHex }) {
-            return match.id
+            return match.peerID.id
         }
         // Also search cache mapping
         if let pair = shortIDToNoiseKey.first(where: { $0.value == fullNoiseKeyHex }) {
@@ -549,7 +549,16 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         
         // Start mesh service immediately
         meshService.startServices()
-        
+
+        // Check initial Bluetooth state after a brief delay to allow centralManager initialization
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self else { return }
+            if let bleService = self.meshService as? BLEService {
+                let state = bleService.getCurrentBluetoothState()
+                self.updateBluetoothState(state)
+            }
+        }
+
         // Announce Tor status (geohash-only; do not show in mesh chat). Only when auto-start is allowed.
         if TorManager.shared.torEnforced && !torStatusAnnounced && TorManager.shared.isAutoStartAllowed() {
             torStatusAnnounced = true
@@ -586,10 +595,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                 var uniquePeers: [String: BitchatPeer] = [:]
                 for peer in peers {
                     // Keep the first occurrence of each peer ID
-                    if uniquePeers[peer.id] == nil {
-                        uniquePeers[peer.id] = peer
+                    if uniquePeers[peer.peerID.id] == nil {
+                        uniquePeers[peer.peerID.id] = peer
                     } else {
-                        SecureLogger.warning("⚠️ Duplicate peer ID detected: \(peer.id) (\(peer.displayName))", category: .session)
+                        SecureLogger.warning("⚠️ Duplicate peer ID detected: \(peer.peerID) (\(peer.displayName))", category: .session)
                     }
                 }
                 self.peerIndex = uniquePeers
@@ -1009,7 +1018,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             content: content,
             timestamp: timestamp,
             isRelay: false,
-            senderPeerID: "nostr:\(event.pubkey.prefix(TransportConfig.nostrShortKeyDisplayLength))",
+            senderPeerID: PeerID(nostr: event.pubkey),
             mentions: mentions.isEmpty ? nil : mentions
         )
         Task { @MainActor in
@@ -1080,7 +1089,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             isRelay: false,
             isPrivate: true,
             recipientNickname: nickname,
-            senderPeerID: convKey,
+            senderPeerID: PeerID(str: convKey),
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
         
@@ -1192,7 +1201,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         }
         
         // Get the peer's nickname to check for temporary Nostr peer IDs
-        let peerNickname = meshService.peerNickname(peerID: peerID)?.lowercased() ?? ""
+        let peerNickname = meshService.peerNickname(peerID: PeerID(str: peerID))?.lowercased() ?? ""
 
         // Check if any temporary Nostr peer IDs have unread messages from this nickname
         for unreadPeerID in unreadPrivateMessages {
@@ -1220,11 +1229,11 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             // Find the ephemeral peer ID for this Noise key
             let ephemeralPeerID = unifiedPeerService.peers.first { peer in
                 peer.noisePublicKey == noisePublicKey
-            }?.id
+            }?.peerID
             
             if let ephemeralID = ephemeralPeerID {
                 // Found the ephemeral peer, use normal toggle
-                unifiedPeerService.toggleFavorite(ephemeralID)
+                unifiedPeerService.toggleFavorite(ephemeralID.id)
                 // Also trigger UI update
                 objectWillChange.send()
             } else {
@@ -1416,7 +1425,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
            let myGeoIdentity = try? NostrIdentityBridge.deriveIdentity(forGeohash: ch.geohash) {
             let suffix = String(myGeoIdentity.publicKeyHex.suffix(4))
             displaySender = nickname + "#" + suffix
-            localSenderPeerID = "nostr:\(myGeoIdentity.publicKeyHex.prefix(TransportConfig.nostrShortKeyDisplayLength))"
+            localSenderPeerID = PeerID(nostr: myGeoIdentity.publicKeyHex)
         }
 
         let message = BitchatMessage(
@@ -1677,7 +1686,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             content: content,
             timestamp: min(rawTs, Date()),
             isRelay: false,
-            senderPeerID: "nostr:\(event.pubkey.prefix(TransportConfig.nostrShortKeyDisplayLength))",
+            senderPeerID: PeerID(nostr: event.pubkey),
             mentions: mentions.isEmpty ? nil : mentions
         )
         
@@ -1777,7 +1786,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             isRelay: false,
             isPrivate: true,
             recipientNickname: nickname,
-            senderPeerID: convKey,
+            senderPeerID: PeerID(str: convKey),
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
         
@@ -2127,7 +2136,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                 content: content,
                 timestamp: ts,
                 isRelay: false,
-                senderPeerID: "nostr:\(event.pubkey.prefix(TransportConfig.nostrShortKeyDisplayLength))",
+                senderPeerID: PeerID(nostr: event.pubkey),
                 mentions: mentions.isEmpty ? nil : mentions
             )
             if !arr.contains(where: { $0.id == msg.id }) {
@@ -2198,7 +2207,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         
         // Check if blocked
         if unifiedPeerService.isBlocked(peerID) {
-            let nickname = meshService.peerNickname(peerID: peerID) ?? "user"
+            let nickname = meshService.peerNickname(peerID: PeerID(str: peerID)) ?? "user"
             addSystemMessage(
                 String(
                     format: String(localized: "system.dm.blocked_recipient", comment: "System message when attempting to message a blocked user"),
@@ -2216,14 +2225,14 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         
         // Determine routing method and recipient nickname
         guard let noiseKey = Data(hexString: peerID) else { return }
-        let isConnected = meshService.isPeerConnected(peerID)
-        let isReachable = meshService.isPeerReachable(peerID)
+        let isConnected = meshService.isPeerConnected(PeerID(str: peerID))
+        let isReachable = meshService.isPeerReachable(PeerID(str: peerID))
         let favoriteStatus = FavoritesPersistenceService.shared.getFavoriteStatus(for: noiseKey)
         let isMutualFavorite = favoriteStatus?.isMutual ?? false
         let hasNostrKey = favoriteStatus?.peerNostrPublicKey != nil
         
         // Get nickname from various sources
-        var recipientNickname = meshService.peerNickname(peerID: peerID)
+        var recipientNickname = meshService.peerNickname(peerID: PeerID(str: peerID))
         if recipientNickname == nil && favoriteStatus != nil {
             recipientNickname = favoriteStatus?.peerNickname
         }
@@ -2396,7 +2405,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             isRelay: false,
             originalSender: nil,
             isPrivate: true,
-            recipientNickname: meshService.peerNickname(peerID: peerID),
+            recipientNickname: meshService.peerNickname(peerID: PeerID(str: peerID)),
             senderPeerID: meshService.myPeerID
         )
         if privateChats[peerID] == nil { privateChats[peerID] = [] }
@@ -2446,7 +2455,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             return
         }
         
-        let peerNickname = meshService.peerNickname(peerID: peerID) ?? "unknown"
+        let peerNickname = meshService.peerNickname(peerID: PeerID(str: peerID)) ?? "unknown"
         
         // Check if the peer is blocked
         if unifiedPeerService.isBlocked(peerID) {
@@ -2506,7 +2515,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                                 originalSender: message.originalSender,
                                 isPrivate: message.isPrivate,
                                 recipientNickname: message.recipientNickname,
-                                senderPeerID: message.senderPeerID == meshService.myPeerID ? meshService.myPeerID : peerID,  // Update peer ID if it's from them
+                                senderPeerID: message.senderPeerID == meshService.myPeerID ? meshService.myPeerID : PeerID(str: peerID),  // Update peer ID if it's from them
                                 mentions: message.mentions,
                                 deliveryStatus: message.deliveryStatus
                             )
@@ -2594,7 +2603,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                                 originalSender: message.originalSender,
                                 isPrivate: message.isPrivate,
                                 recipientNickname: message.recipientNickname,
-                                senderPeerID: peerID,  // Update to match current peer
+                                senderPeerID: PeerID(str: peerID),  // Update to match current peer
                                 mentions: message.mentions,
                                 deliveryStatus: message.deliveryStatus
                             )
@@ -2624,10 +2633,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         
         // Trigger handshake if needed (mesh peers only). Skip for Nostr geohash conv keys.
         if !peerID.hasPrefix("nostr_") && !peerID.hasPrefix("nostr:") {
-            let sessionState = meshService.getNoiseSessionState(for: peerID)
+            let sessionState = meshService.getNoiseSessionState(for: PeerID(str: peerID))
             switch sessionState {
             case .none, .failed:
-                meshService.triggerHandshake(with: peerID)
+                meshService.triggerHandshake(with: PeerID(str: peerID))
             default:
                 break
             }
@@ -2799,7 +2808,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                 
                 // Find peer nickname
                 let peerNickname: String
-                if let nickname = meshService.peerNickname(peerID: peerID) {
+                if let nickname = meshService.peerNickname(peerID: PeerID(str: peerID)) {
                     peerNickname = nickname
                 } else if let favorite = FavoritesPersistenceService.shared.getFavoriteStatus(for: peerPublicKey) {
                     peerNickname = favorite.peerNickname
@@ -2834,6 +2843,12 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
     
     @MainActor
     @objc private func appDidBecomeActive() {
+        // Check Bluetooth state and show alert if needed
+        if let bleService = meshService as? BLEService {
+            let currentState = bleService.getCurrentBluetoothState()
+            updateBluetoothState(currentState)
+        }
+
         // When app becomes active, send read receipts for visible private chat
         if let peerID = selectedPrivateChatPeer {
             // Try immediately
@@ -2864,10 +2879,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         
         if let peerID = selectedPrivateChatPeer {
             // In private chat - send to the other person
-            if let peerNickname = meshService.peerNickname(peerID: peerID) {
+            if let peerNickname = meshService.peerNickname(peerID: PeerID(str: peerID)) {
                 // Only send screenshot notification if we have an established session
                 // This prevents triggering handshake requests for screenshot notifications
-                let sessionState = meshService.getNoiseSessionState(for: peerID)
+                let sessionState = meshService.getNoiseSessionState(for: PeerID(str: peerID))
                 switch sessionState {
                 case .established:
                     // Send the message directly without going through sendPrivateMessage to avoid local echo
@@ -2886,7 +2901,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                 isRelay: false,
                 originalSender: nil,
                 isPrivate: true,
-                recipientNickname: meshService.peerNickname(peerID: peerID),
+                recipientNickname: meshService.peerNickname(peerID: PeerID(str: peerID)),
                 senderPeerID: meshService.myPeerID
             )
             var chats = privateChats
@@ -2972,7 +2987,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         var actualPeerID = peerID
         
         // Check if this peer ID exists in current nicknames
-        if meshService.peerNickname(peerID: peerID) == nil {
+        if meshService.peerNickname(peerID: PeerID(str: peerID)) == nil {
             // Peer not found with this ID, try to find by fingerprint or nickname
             if let oldNoiseKey = Data(hexString: peerID),
                let favoriteStatus = FavoritesPersistenceService.shared.getFavoriteStatus(for: oldNoiseKey) {
@@ -2982,7 +2997,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                 for (currentPeerID, currentNickname) in meshService.getPeerNicknames() {
                     if currentNickname == peerNickname {
                         SecureLogger.info("📖 Resolved updated peer ID for read receipt: \(peerID) -> \(currentPeerID)", category: .session)
-                        actualPeerID = currentPeerID
+                        actualPeerID = currentPeerID.id
                         break
                     }
                 }
@@ -3054,7 +3069,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                     if !sentReadReceipts.contains(message.id) {
                         // Use stable Noise key hex if available; else fall back to peerID
                         let recipPeer = (Data(hexString: peerID) != nil) ? peerID : (unifiedPeerService.getPeer(by: peerID)?.noisePublicKey.hexEncodedString() ?? peerID)
-                        let receipt = ReadReceipt(originalMessageID: message.id, readerID: meshService.myPeerID, readerNickname: nickname)
+                        let receipt = ReadReceipt(originalMessageID: message.id, readerID: meshService.myPeerID.id, readerNickname: nickname)
                         messageRouter.sendReadReceipt(receipt, to: PeerID(str: recipPeer))
                         sentReadReceipts.insert(message.id)
                     }
@@ -3480,7 +3495,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                             if case .location(let ch) = activeChannel, let id = try? NostrIdentityBridge.deriveIdentity(forGeohash: ch.geohash) {
                                 return String(id.publicKeyHex.suffix(4))
                             }
-                            return String(meshService.myPeerID.prefix(4))
+                            return String(meshService.myPeerID.id.prefix(4))
                         }()
                         let isMentionToMe: Bool = {
                             if mBase == nickname {
@@ -3772,7 +3787,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         // Check if we've ever established a session by looking for a fingerprint
         let hasEverEstablishedSession = getFingerprint(for: peerID) != nil
         
-        let sessionState = meshService.getNoiseSessionState(for: peerID)
+        let sessionState = meshService.getNoiseSessionState(for: PeerID(str: peerID))
         
         let status: EncryptionStatus
         
@@ -3936,8 +3951,8 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         // Build current peer->seed map (excluding self)
         let myID = meshService.myPeerID
         var currentSeeds: [String: String] = [:]
-        for p in allPeers where p.id != myID {
-            currentSeeds[p.id] = meshSeed(for: p.id)
+        for p in allPeers where p.peerID != myID {
+            currentSeeds[p.peerID.id] = meshSeed(for: p.peerID.id)
         }
         // If seeds unchanged and palette exists for both themes, skip
         if currentSeeds == peerPaletteSeeds,
@@ -4256,7 +4271,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         
         // First try direct peer nicknames from mesh service
         let peerNicknames = meshService.getPeerNicknames()
-        if let nickname = peerNicknames[peerID] {
+        if let nickname = peerNicknames[PeerID(str: peerID)] {
             return nickname
         }
         
@@ -4322,7 +4337,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         // Also log any offline favorites and whether we consider them verified
         let offlineFavorites = unifiedPeerService.favorites.filter { !$0.isConnected }
         for fav in offlineFavorites {
-            let fp = unifiedPeerService.getFingerprint(for: fav.id)
+            let fp = unifiedPeerService.getFingerprint(for: fav.peerID.id)
             let isVer = fp.flatMap { verifiedFingerprints.contains($0) } ?? false
             let fpShort = fp?.prefix(8) ?? "nil"
             SecureLogger.info("⭐️ Favorite offline: \(fav.nickname) fp=\(fpShort) verified=\(isVer)", category: .security)
@@ -4365,7 +4380,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
 
                 // If a QR verification is pending but not sent yet, send it now that session is authenticated
                 if var pending = self.pendingQRVerifications[peerID], pending.sent == false {
-                    self.meshService.sendVerifyChallenge(to: peerID, noiseKeyHex: pending.noiseKeyHex, nonceA: pending.nonceA)
+                    self.meshService.sendVerifyChallenge(to: PeerID(str: peerID), noiseKeyHex: pending.noiseKeyHex, nonceA: pending.nonceA)
                     pending.sent = true
                     self.pendingQRVerifications[peerID] = pending
                     SecureLogger.debug("📤 Sent deferred verify challenge to \(peerID) after handshake", category: .security)
@@ -4450,12 +4465,12 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                 originalSender: nil,
                 isPrivate: true,
                 recipientNickname: nickname,
-                senderPeerID: peerID,
+                senderPeerID: PeerID(str: peerID),
                 mentions: pmMentions.isEmpty ? nil : pmMentions
             )
                 handlePrivateMessage(msg)
                 // Send delivery ACK back over BLE
-                meshService.sendDeliveryAck(for: pm.messageID, to: peerID)
+                meshService.sendDeliveryAck(for: pm.messageID, to: PeerID(str: peerID))
 
             case .delivered:
                 guard let messageID = String(data: payload, encoding: .utf8) else { return }
@@ -4501,7 +4516,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                         }
                     }
                 }
-                meshService.sendVerifyResponse(to: peerID, noiseKeyHex: tlv.noiseKeyHex, nonceA: tlv.nonceA)
+                meshService.sendVerifyResponse(to: PeerID(str: peerID), noiseKeyHex: tlv.noiseKeyHex, nonceA: tlv.nonceA)
                 // Silent response: no toast needed on responder
             case .verifyResponse:
                 guard let resp = VerificationService.shared.parseVerifyResponse(payload) else { return }
@@ -4557,7 +4572,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                 originalSender: nil,
                 isPrivate: false,
                 recipientNickname: nil,
-                senderPeerID: peerID,
+                senderPeerID: PeerID(str: peerID),
                 mentions: publicMentions.isEmpty ? nil : publicMentions
             )
             handlePublicMessage(msg)
@@ -4574,22 +4589,22 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         guard let peer = unifiedPeerService.peers.first(where: { $0.noisePublicKey.hexEncodedString().lowercased() == targetNoise }) else {
             return false
         }
-        let peerID = peer.id
+        let peerID = peer.peerID
         // If we already have a pending verification with this peer, don't send another
-        if pendingQRVerifications[peerID] != nil {
+        if pendingQRVerifications[peerID.id] != nil {
             return true
         }
         // Generate nonceA
         var nonce = Data(count: 16)
         _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
         var pending = PendingVerification(noiseKeyHex: qr.noiseKeyHex, signKeyHex: qr.signKeyHex, nonceA: nonce, startedAt: Date(), sent: false)
-        pendingQRVerifications[peerID] = pending
+        pendingQRVerifications[peerID.id] = pending
         // If Noise session is established, send immediately; otherwise trigger handshake and send on auth
         let noise = meshService.getNoiseService()
-        if noise.hasEstablishedSession(with: PeerID(str: peerID)) {
+        if noise.hasEstablishedSession(with: peerID) {
             meshService.sendVerifyChallenge(to: peerID, noiseKeyHex: qr.noiseKeyHex, nonceA: nonce)
             pending.sent = true
-            pendingQRVerifications[peerID] = pending
+            pendingQRVerifications[peerID.id] = pending
         } else {
             meshService.triggerHandshake(with: peerID)
         }
@@ -4597,8 +4612,16 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
     }
 
     // Mention parsing moved from BLE – use the existing non-optional helper below
+    // MARK: - Bluetooth State Monitoring
+
+    func didUpdateBluetoothState(_ state: CBManagerState) {
+        Task { @MainActor in
+            updateBluetoothState(state)
+        }
+    }
+
     // MARK: - Peer Connection Events
-    
+
     func didConnectToPeer(_ peerID: String) {
         SecureLogger.debug("🤝 Peer connected: \(peerID)", category: .session)
         
@@ -4658,7 +4681,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                         originalSender: msg.originalSender,
                         isPrivate: msg.isPrivate,
                         recipientNickname: msg.recipientNickname,
-                        senderPeerID: (msg.senderPeerID == meshService.myPeerID) ? meshService.myPeerID : stableKeyHex,
+                        senderPeerID: msg.senderPeerID == meshService.myPeerID ? meshService.myPeerID : PeerID(str: stableKeyHex),
                         mentions: msg.mentions,
                         deliveryStatus: msg.deliveryStatus
                     )
@@ -4713,7 +4736,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                 self.networkResetTimer = nil
                 // Count mesh peers that are connected OR recently reachable via mesh relays
                 let meshPeers = peers.filter { peerID in
-                    self.meshService.isPeerConnected(peerID) || self.meshService.isPeerReachable(peerID)
+                    self.meshService.isPeerConnected(PeerID(str: peerID)) || self.meshService.isPeerReachable(PeerID(str: peerID))
                 }
                 
                 // Rising-edge only: previously zero peers, now > 0 peers
@@ -4766,7 +4789,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
     /// Clean up stale unread peer IDs that no longer exist in the peer list
     @MainActor
     private func cleanupStaleUnreadPeerIDs() {
-        let currentPeerIDs = Set(unifiedPeerService.peers.map { $0.id })
+        let currentPeerIDs = Set(unifiedPeerService.peers.map { $0.peerID.id })
         let staleIDs = unreadPrivateMessages.subtracting(currentPeerIDs)
         
         if !staleIDs.isEmpty {
@@ -4844,7 +4867,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         var validTokens = Set(peerNicknames.values)
         // Always allow mentioning self by base nickname and suffixed disambiguator
         validTokens.insert(nickname)
-        let selfSuffixToken = nickname + "#" + String(meshService.myPeerID.prefix(4))
+        let selfSuffixToken = nickname + "#" + String(meshService.myPeerID.id.prefix(4))
         validTokens.insert(selfSuffixToken)
         
         for match in matches {
@@ -5190,7 +5213,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             isRelay: false,
             isPrivate: true,
             recipientNickname: nickname,
-            senderPeerID: targetPeerID,
+            senderPeerID: PeerID(str: targetPeerID),
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
         
@@ -5253,7 +5276,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
     @MainActor
     private func mirrorToEphemeralIfNeeded(_ message: BitchatMessage, targetPeerID: String, key: Data?) {
         guard let key,
-              let ephemeralPeerID = unifiedPeerService.peers.first(where: { $0.noisePublicKey == key })?.id,
+              let ephemeralPeerID = unifiedPeerService.peers.first(where: { $0.noisePublicKey == key })?.peerID.id,
               ephemeralPeerID != targetPeerID
         else {
             return
@@ -5290,12 +5313,12 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
     private func handleViewingThisChat(_ message: BitchatMessage, targetPeerID: String, key: Data?, senderPubkey: String) {
         unreadPrivateMessages.remove(targetPeerID)
         if let key,
-           let ephemeralPeerID = unifiedPeerService.peers.first(where: { $0.noisePublicKey == key })?.id {
+           let ephemeralPeerID = unifiedPeerService.peers.first(where: { $0.noisePublicKey == key })?.peerID.id {
             unreadPrivateMessages.remove(ephemeralPeerID)
         }
         if !sentReadReceipts.contains(message.id) {
             if let key {
-                let receipt = ReadReceipt(originalMessageID: message.id, readerID: meshService.myPeerID, readerNickname: nickname)
+                let receipt = ReadReceipt(originalMessageID: message.id, readerID: meshService.myPeerID.id, readerNickname: nickname)
                 SecureLogger.debug("Viewing chat; sending READ ack for \(message.id.prefix(8))… via router", category: .session)
                 messageRouter.sendReadReceipt(receipt, to: PeerID(hexData: key))
                 sentReadReceipts.insert(message.id)
@@ -5322,7 +5345,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         
         unreadPrivateMessages.insert(targetPeerID)
         if let key,
-           let ephemeralPeerID = unifiedPeerService.peers.first(where: { $0.noisePublicKey == key })?.id,
+           let ephemeralPeerID = unifiedPeerService.peers.first(where: { $0.noisePublicKey == key })?.peerID.id,
            ephemeralPeerID != targetPeerID {
             unreadPrivateMessages.insert(ephemeralPeerID)
         }
@@ -5530,7 +5553,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             originalSender: nil,
             isPrivate: true,
             recipientNickname: nickname,
-            senderPeerID: tempPeerID,
+            senderPeerID: PeerID(str: tempPeerID),
             mentions: nil,
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
@@ -5636,7 +5659,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         }
         
         // Try mesh first for connected peers
-        if meshService.isPeerConnected(peerID) {
+        if meshService.isPeerConnected(PeerID(str: peerID)) {
             messageRouter.sendFavoriteNotification(to: PeerID(str: peerID), isFavorite: isFavorite)
             SecureLogger.debug("📤 Sent favorite notification via BLE to \(peerID)", category: .session)
         } else if let key = noiseKey {
@@ -5693,7 +5716,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                 originalSender: message.originalSender,
                 isPrivate: message.isPrivate,
                 recipientNickname: message.recipientNickname,
-                senderPeerID: message.senderPeerID?.id,
+                senderPeerID: message.senderPeerID,
                 mentions: message.mentions,
                 deliveryStatus: message.deliveryStatus
             )
@@ -5907,7 +5930,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
             if !sentReadReceipts.contains(message.id) {
                 let receipt = ReadReceipt(
                     originalMessageID: message.id,
-                    readerID: meshService.myPeerID,
+                    readerID: meshService.myPeerID.id,
                     readerNickname: nickname
                 )
                 
@@ -5918,7 +5941,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
                     if let noiseKey = Data(hexString: recipientID),
                        let favoriteStatus = FavoritesPersistenceService.shared.getFavoriteStatus(for: noiseKey),
                        favoriteStatus.peerNostrPublicKey != nil,
-                       self.meshService.peerNickname(peerID: recipientID) == nil {
+                       self.meshService.peerNickname(peerID: PeerID(str: recipientID)) == nil {
                         originalTransport = "nostr"
                     }
                     
@@ -6114,7 +6137,7 @@ private func checkForMentions(_ message: BitchatMessage) {
     let meshPeers = meshService.getPeerNicknames()
     let collisions = meshPeers.values.filter { $0.hasPrefix(nickname + "#") }
     if !collisions.isEmpty {
-        let suffix = "#" + String(meshService.myPeerID.prefix(4))
+        let suffix = "#" + String(meshService.myPeerID.id.prefix(4))
         myTokens = [nickname + suffix]
     }
     let isMentioned = (message.mentions?.contains { myTokens.contains($0) } ?? false)
