@@ -94,6 +94,7 @@ final class BLEService: NSObject {
     private var noiseService: NoiseEncryptionService
     private let identityManager: SecureIdentityStateManagerProtocol
     private let keychain: KeychainManagerProtocol
+    private let idBridge: NostrIdentityBridge
     private var myPeerIDData: Data = Data()
 
     // MARK: - Advertising Privacy
@@ -198,8 +199,13 @@ final class BLEService: NSObject {
     
     // MARK: - Initialization
     
-    init(keychain: KeychainManagerProtocol, identityManager: SecureIdentityStateManagerProtocol) {
+    init(
+        keychain: KeychainManagerProtocol,
+        idBridge: NostrIdentityBridge,
+        identityManager: SecureIdentityStateManagerProtocol
+    ) {
         self.keychain = keychain
+        self.idBridge = idBridge
         noiseService = NoiseEncryptionService(keychain: keychain)
         self.identityManager = identityManager
         super.init()
@@ -613,7 +619,7 @@ final class BLEService: NSObject {
         var content = isFavorite ? "[FAVORITED]" : "[UNFAVORITED]"
         
         // Add our Nostr public key if available
-        if let myNostrIdentity = try? NostrIdentityBridge.getCurrentNostrIdentity() {
+        if let myNostrIdentity = try? idBridge.getCurrentNostrIdentity() {
             content += ":" + myNostrIdentity.npub
             SecureLogger.debug("📝 Sending favorite notification with Nostr npub: \(myNostrIdentity.npub)", category: .session)
         }
@@ -1507,6 +1513,22 @@ extension BLEService {
             block()
         }
     }
+
+    /// Safely fetch the current direct-link state for a peer using the BLE queue.
+    private func linkState(for peerID: PeerID) -> (hasPeripheral: Bool, hasCentral: Bool) {
+        let computeState = { () -> (Bool, Bool) in
+            let peripheralUUID = self.peerToPeripheralUUID[peerID]
+            let hasPeripheral = peripheralUUID.flatMap { self.peripherals[$0]?.isConnected } ?? false
+            let hasCentral = self.centralToPeerID.values.contains(peerID)
+            return (hasPeripheral, hasCentral)
+        }
+
+        if DispatchQueue.getSpecific(key: bleQueueKey) != nil {
+            return computeState()
+        } else {
+            return bleQueue.sync { computeState() }
+        }
+    }
     
     private func configureNoiseServiceCallbacks(for service: NoiseEncryptionService) {
         service.onPeerAuthenticated = { [weak self] peerID, fingerprint in
@@ -2200,6 +2222,16 @@ extension BLEService {
     }
     
     private func handleFragment(_ packet: BitchatPacket, from peerID: PeerID) {
+        if DispatchQueue.getSpecific(key: messageQueueKey) != nil {
+            _handleFragment(packet, from: peerID)
+        } else {
+            messageQueue.async(flags: .barrier) { [weak self] in
+                self?._handleFragment(packet, from: peerID)
+            }
+        }
+    }
+
+    private func _handleFragment(_ packet: BitchatPacket, from peerID: PeerID) {
         // Don't process our own fragments
         if peerID == myPeerID {
             return
@@ -2442,15 +2474,15 @@ extension BLEService {
         // Track if this is a new or reconnected peer
         var isNewPeer = false
         var isReconnectedPeer = false
+        let directLinkState = linkState(for: peerID)
         
         collectionsQueue.sync(flags: .barrier) {
             // Check if we have an actual BLE connection to this peer
-            let peripheralUUID = peerToPeripheralUUID[peerID]
-            let hasPeripheralConnection = peripheralUUID != nil && peripherals[peripheralUUID!]?.isConnected == true
+            let hasPeripheralConnection = directLinkState.hasPeripheral
             
             // Check if this peer is subscribed to us as a central
             // Note: We can't identify which specific central is which peer without additional mapping
-            let hasCentralSubscription = centralToPeerID.values.contains(peerID)
+            let hasCentralSubscription = directLinkState.hasCentral
             
             // Direct announces arrive with full TTL (no prior hop)
             let isDirectAnnounce = (packet.ttl == messageTTL)
@@ -2682,12 +2714,8 @@ extension BLEService {
             return
         }
         // Determine if we have a direct link to the sender
-        let hasDirectLink: Bool = collectionsQueue.sync {
-            let perUUID = peerToPeripheralUUID[peerID]
-            let perConnected = perUUID != nil && peripherals[perUUID!]?.isConnected == true
-            let hasCentral = centralToPeerID.values.contains(peerID)
-            return perConnected || hasCentral
-        }
+        let directLink = linkState(for: peerID)
+        let hasDirectLink = directLink.hasPeripheral || directLink.hasCentral
 
         let pathTag = hasDirectLink ? "direct" : "mesh"
         SecureLogger.debug("💬 [\(senderNickname)] TTL:\(packet.ttl) (\(pathTag)): \(String(content.prefix(50)))\(content.count > 50 ? "..." : "")", category: .session)
@@ -3030,6 +3058,11 @@ extension BLEService {
     private func checkPeerConnectivity() {
         let now = Date()
         var disconnectedPeers: [String] = []
+        let peerIDsForLinkState: [PeerID] = collectionsQueue.sync { Array(peers.keys) }
+        var cachedLinkStates: [PeerID: (hasPeripheral: Bool, hasCentral: Bool)] = [:]
+        for peerID in peerIDsForLinkState {
+            cachedLinkStates[peerID] = linkState(for: peerID)
+        }
         
         var removedOfflineCount = 0
         collectionsQueue.sync(flags: .barrier) {
@@ -3038,9 +3071,9 @@ extension BLEService {
                 let retention: TimeInterval = peer.isVerifiedNickname ? TransportConfig.bleReachabilityRetentionVerifiedSeconds : TransportConfig.bleReachabilityRetentionUnverifiedSeconds
                 if peer.isConnected && age > TransportConfig.blePeerInactivityTimeoutSeconds {
                     // Check if we still have an active BLE connection to this peer
-                    let hasPeripheralConnection = peerToPeripheralUUID[peerID] != nil &&
-                                                 peripherals[peerToPeripheralUUID[peerID]!]?.isConnected == true
-                    let hasCentralConnection = centralToPeerID.values.contains(peerID)
+                    let state = cachedLinkStates[peerID] ?? (hasPeripheral: false, hasCentral: false)
+                    let hasPeripheralConnection = state.hasPeripheral
+                    let hasCentralConnection = state.hasCentral
                     
                     // If direct link is gone, mark as not connected (retain entry for reachability)
                     if !hasPeripheralConnection && !hasCentralConnection {
