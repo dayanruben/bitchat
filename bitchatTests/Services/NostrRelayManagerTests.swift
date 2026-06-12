@@ -133,6 +133,99 @@ final class NostrRelayManagerTests: XCTestCase {
         XCTAssertTrue(context.sessionFactory.requestedURLs.isEmpty)
     }
 
+    func test_subscribe_parkedEOSEFiresAfterFallbackTimeoutWhenTorNeverBecomesReady() async {
+        let relayURL = "wss://tor-eose-parked-fallback.example"
+        let context = makeContext(permission: .denied, userTorEnabled: true, torEnforced: true, torIsReady: false)
+        var eoseCount = 0
+
+        context.manager.subscribe(
+            filter: makeFilter(),
+            id: "tor-parked-fallback",
+            relayUrls: [relayURL],
+            handler: { _ in },
+            onEOSE: { eoseCount += 1 }
+        )
+
+        // Parking the callback schedules the normal EOSE fallback, not just
+        // the Tor retry-exhaustion unblock (~minutes later).
+        XCTAssertEqual(context.scheduler.scheduled.first?.delay, TransportConfig.nostrSubscriptionEOSEFallbackSeconds)
+        XCTAssertEqual(eoseCount, 0)
+
+        context.scheduler.runNext()
+        let unblocked = await waitUntil { eoseCount == 1 }
+        XCTAssertTrue(unblocked)
+        XCTAssertTrue(context.sessionFactory.requestedURLs.isEmpty)
+
+        // A later retry-exhaustion unblock must not fire the callback again.
+        for _ in 0..<TransportConfig.nostrTorReadyMaxWaitAttempts {
+            context.torWaiter.resolve(false)
+        }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(eoseCount, 1)
+    }
+
+    func test_subscribe_parkedEOSEFallbackIsNoOpWhenTorRecoversFirst() async throws {
+        let relayURL = "wss://tor-eose-parked-recover.example"
+        let context = makeContext(permission: .denied, userTorEnabled: true, torEnforced: true, torIsReady: false)
+        var eoseCount = 0
+
+        context.manager.subscribe(
+            filter: makeFilter(),
+            id: "tor-parked-recover",
+            relayUrls: [relayURL],
+            handler: { _ in },
+            onEOSE: { eoseCount += 1 }
+        )
+
+        // Tor recovers before the fallback fires; the callback is promoted to
+        // a real EOSE tracker when the subscription flushes.
+        context.torWaiter.resolve(true)
+        let subscribed = await waitUntil {
+            context.sessionFactory.latestConnection(for: relayURL)?.sentStrings.count == 1
+        }
+        XCTAssertTrue(subscribed)
+
+        // The parked fallback (scheduled first) is now a no-op.
+        context.scheduler.runNext()
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(eoseCount, 0)
+
+        // The real EOSE still completes the initial load exactly once...
+        try context.sessionFactory.latestConnection(for: relayURL)?.emitEOSE(subscriptionID: "tor-parked-recover")
+        let eoseCompleted = await waitUntil { eoseCount == 1 }
+        XCTAssertTrue(eoseCompleted)
+
+        // ...and the promoted tracker's own fallback does not double-fire.
+        context.scheduler.runNext()
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(eoseCount, 1)
+    }
+
+    func test_subscribe_parkedEOSEFallbackIsNoOpAfterRetryExhaustionUnblock() async {
+        let relayURL = "wss://tor-eose-parked-exhausted.example"
+        let context = makeContext(permission: .denied, userTorEnabled: true, torEnforced: true, torIsReady: false)
+        var eoseCount = 0
+
+        context.manager.subscribe(
+            filter: makeFilter(),
+            id: "tor-parked-exhausted",
+            relayUrls: [relayURL],
+            handler: { _ in },
+            onEOSE: { eoseCount += 1 }
+        )
+
+        // Retry exhaustion unblocks the parked callback first.
+        for _ in 0..<TransportConfig.nostrTorReadyMaxWaitAttempts {
+            context.torWaiter.resolve(false)
+        }
+        XCTAssertEqual(eoseCount, 1)
+
+        // The parked fallback finds nothing to do.
+        context.scheduler.runNext()
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(eoseCount, 1)
+    }
+
     func test_sendEvent_survivesFailedTorWaitAndSendsWhenTorRecovers() async throws {
         let relayURL = "wss://tor-send-retry.example"
         let context = makeContext(permission: .denied, userTorEnabled: true, torEnforced: true, torIsReady: false)
@@ -761,12 +854,203 @@ final class NostrRelayManagerTests: XCTestCase {
         }
         XCTAssertTrue(subscribed)
 
-        let timedOut = await waitUntil(timeout: 3.0) { eoseCount == 1 }
+        // The fallback is scheduled but has not fired yet.
+        XCTAssertEqual(context.scheduler.scheduled.first?.delay, TransportConfig.nostrSubscriptionEOSEFallbackSeconds)
+        XCTAssertEqual(eoseCount, 0)
+
+        context.scheduler.runNext()
+        let timedOut = await waitUntil { eoseCount == 1 }
         XCTAssertTrue(timedOut)
 
         try context.sessionFactory.latestConnection(for: relayURL)?.emitEOSE(subscriptionID: "timeout")
         try? await Task.sleep(nanoseconds: 20_000_000)
         XCTAssertEqual(eoseCount, 1)
+    }
+
+    func test_eose_completesWhenRelayDisconnectsBeforeEOSE() async throws {
+        let relayOne = "wss://eose-drop-one.example"
+        let relayTwo = "wss://eose-drop-two.example"
+        let context = makeContext(permission: .denied)
+        var eoseCount = 0
+
+        context.manager.subscribe(
+            filter: makeFilter(),
+            id: "eose-drop",
+            relayUrls: [relayOne, relayTwo],
+            handler: { _ in },
+            onEOSE: { eoseCount += 1 }
+        )
+
+        let subscribed = await waitUntil {
+            context.sessionFactory.latestConnection(for: relayOne)?.sentStrings.count == 1 &&
+            context.sessionFactory.latestConnection(for: relayTwo)?.sentStrings.count == 1
+        }
+        XCTAssertTrue(subscribed)
+
+        try context.sessionFactory.latestConnection(for: relayOne)?.emitEOSE(subscriptionID: "eose-drop")
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(eoseCount, 0)
+
+        context.sessionFactory.latestConnection(for: relayTwo)?.fail(
+            error: NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+        )
+        let completed = await waitUntil { eoseCount == 1 }
+        XCTAssertTrue(completed)
+    }
+
+    func test_reconnect_replaysActiveSubscriptionsAndDeliversEvents() async throws {
+        let relayURL = "wss://replay.example"
+        let context = makeContext(permission: .denied)
+        var received: [NostrEvent] = []
+
+        context.manager.subscribe(
+            filter: makeFilter(),
+            id: "replay-sub",
+            relayUrls: [relayURL],
+            handler: { received.append($0) }
+        )
+        let subscribed = await waitUntil {
+            context.sessionFactory.latestConnection(for: relayURL)?.sentStrings.contains { $0.contains("replay-sub") } == true
+        }
+        XCTAssertTrue(subscribed)
+
+        // Drop the socket; the relay forgets the subscription with it.
+        context.sessionFactory.latestConnection(for: relayURL)?.fail(
+            error: NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)
+        )
+        let retryScheduled = await waitUntil { !context.scheduler.scheduled.isEmpty }
+        XCTAssertTrue(retryScheduled)
+        context.scheduler.runNext()
+
+        let replayed = await waitUntil {
+            let connections = context.sessionFactory.connectionsByURL[relayURL] ?? []
+            return connections.count == 2 &&
+                connections.last?.sentStrings.contains { $0.contains("replay-sub") } == true
+        }
+        XCTAssertTrue(replayed)
+
+        let event = try makeSignedEvent(content: "after reconnect")
+        try context.sessionFactory.latestConnection(for: relayURL)?.emitEventMessage(subscriptionID: "replay-sub", event: event)
+        let delivered = await waitUntil { received.count == 1 }
+        XCTAssertTrue(delivered)
+    }
+
+    func test_disconnectThenConnect_restoresSubscriptions() async {
+        let relayURL = "wss://restore.example"
+        let context = makeContext(permission: .denied)
+
+        context.manager.subscribe(filter: makeFilter(), id: "restore-sub", relayUrls: [relayURL], handler: { _ in })
+        let subscribed = await waitUntil {
+            context.sessionFactory.latestConnection(for: relayURL)?.sentStrings.contains { $0.contains("restore-sub") } == true
+        }
+        XCTAssertTrue(subscribed)
+
+        // Background → foreground: connections reset, subscriptions must survive.
+        context.manager.disconnect()
+        context.manager.connect()
+
+        let resubscribed = await waitUntil {
+            let connections = context.sessionFactory.connectionsByURL[relayURL] ?? []
+            return connections.count == 2 &&
+                connections.last?.sentStrings.contains { $0.contains("restore-sub") } == true
+        }
+        XCTAssertTrue(resubscribed)
+    }
+
+    func test_subscriptionSendFailure_retriesOnReconnect() async {
+        let relayURL = "wss://flaky-send.example"
+        let context = makeContext(permission: .denied)
+        context.sessionFactory.sendErrorByURL[relayURL] = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+
+        context.manager.subscribe(filter: makeFilter(), id: "flaky-sub", relayUrls: [relayURL], handler: { _ in })
+        let attempted = await waitUntil {
+            context.sessionFactory.latestConnection(for: relayURL)?.sentStrings.isEmpty == false
+        }
+        XCTAssertTrue(attempted)
+
+        // The REQ send failed; the subscription must survive for the next connection.
+        context.sessionFactory.sendErrorByURL[relayURL] = nil
+        context.sessionFactory.latestConnection(for: relayURL)?.fail(
+            error: NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)
+        )
+        let retryScheduled = await waitUntil { !context.scheduler.scheduled.isEmpty }
+        XCTAssertTrue(retryScheduled)
+        context.scheduler.runNext()
+
+        let resubscribed = await waitUntil {
+            let connections = context.sessionFactory.connectionsByURL[relayURL] ?? []
+            return connections.count == 2 &&
+                connections.last?.sentStrings.contains { $0.contains("flaky-sub") } == true
+        }
+        XCTAssertTrue(resubscribed)
+    }
+
+    func test_staleSendCompletionFromDeadSocket_doesNotBlockReplayOnNextConnection() async {
+        let relayURL = "wss://stale-completion.example"
+        let context = makeContext(permission: .denied)
+
+        context.manager.subscribe(filter: makeFilter(), id: "stale-sub", relayUrls: [relayURL], handler: { _ in })
+        // The connection exists synchronously; its REQ flush lands on a later
+        // main-queue tick, so deferring completions here is race-free.
+        let connectionA = context.sessionFactory.latestConnection(for: relayURL)
+        XCTAssertNotNil(connectionA)
+        connectionA?.deferSendCompletions = true
+
+        let reqSent = await waitUntil {
+            connectionA?.sentStrings.contains { $0.contains("stale-sub") } == true
+        }
+        XCTAssertTrue(reqSent)
+
+        // Socket dies while the REQ's send completion is still in flight.
+        connectionA?.fail(error: NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost))
+        let disconnected = await waitUntil {
+            context.manager.relays.first(where: { $0.url == relayURL })?.isConnected == false
+        }
+        XCTAssertTrue(disconnected)
+
+        // The stale success completion must not mark the subscription active.
+        connectionA?.flushDeferredSendCompletions()
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        context.scheduler.runNext()
+        let replayed = await waitUntil {
+            let connections = context.sessionFactory.connectionsByURL[relayURL] ?? []
+            return connections.count == 2 &&
+                connections.last?.sentStrings.contains { $0.contains("stale-sub") } == true
+        }
+        XCTAssertTrue(replayed)
+    }
+
+    func test_permanentFailure_decaysAfterCooldownAndRetries() async {
+        let relayURL = "wss://cooldown.example"
+        let context = makeContext(permission: .denied)
+        context.sessionFactory.pingErrorByURL[relayURL] = NSError(
+            domain: NSURLErrorDomain,
+            code: NSURLErrorCannotFindHost,
+            userInfo: [NSLocalizedDescriptionKey: "DNS failure"]
+        )
+
+        context.manager.ensureConnections(to: [relayURL])
+        let failed = await waitUntil {
+            context.manager.relays.first(where: { $0.url == relayURL })?.reconnectAttempts == TransportConfig.nostrRelayMaxReconnectAttempts
+        }
+        XCTAssertTrue(failed)
+
+        // Within the cooldown the relay is skipped.
+        let countBefore = context.sessionFactory.requestedURLs.count
+        context.manager.ensureConnections(to: [relayURL])
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(context.sessionFactory.requestedURLs.count, countBefore)
+
+        // After the cooldown it gets another chance and recovers.
+        context.sessionFactory.pingErrorByURL[relayURL] = nil
+        context.clock.now = context.clock.now.addingTimeInterval(TransportConfig.nostrRelayFailureCooldownSeconds + 1)
+        context.manager.ensureConnections(to: [relayURL])
+        let retried = await waitUntil {
+            context.sessionFactory.requestedURLs.count == countBefore + 1 &&
+            context.manager.relays.first(where: { $0.url == relayURL })?.isConnected == true
+        }
+        XCTAssertTrue(retried)
     }
 
     func test_receiveFailure_schedulesReconnectWithBackoff() async {
@@ -1004,6 +1288,98 @@ final class NostrRelayManagerTests: XCTestCase {
         XCTAssertTrue(reconnected)
     }
 
+    func test_pendingSubscriptions_perRelayCapEvictsOldestByInsertionOrder() async {
+        let relayURL = "wss://pending-cap.example"
+        // Tor stalled: nothing flushes, so every REQ stays pending.
+        let context = makeContext(permission: .denied, userTorEnabled: true, torEnforced: true, torIsReady: false)
+        let cap = TransportConfig.nostrPendingSubscriptionsPerRelayCap
+
+        for i in 0..<(cap + 3) {
+            context.manager.subscribe(filter: makeFilter(), id: "cap-sub-\(i)", relayUrls: [relayURL], handler: { _ in })
+        }
+
+        XCTAssertEqual(context.manager.debugPendingSubscriptionCount(for: relayURL), cap)
+        let pendingIDs = context.manager.debugPendingSubscriptionIDs(for: relayURL)
+        // The three oldest entries were evicted; the newest survive.
+        for i in 0..<3 {
+            XCTAssertFalse(pendingIDs.contains("cap-sub-\(i)"), "expected cap-sub-\(i) to be evicted")
+        }
+        for i in 3..<(cap + 3) {
+            XCTAssertTrue(pendingIDs.contains("cap-sub-\(i)"), "expected cap-sub-\(i) to be retained")
+        }
+    }
+
+    func test_pendingSubscriptions_staleEntriesSweptOnConnectAttempt() async {
+        let relayURL = "wss://pending-sweep.example"
+        // Tor stalled: the REQ stays pending and no socket ever opens.
+        let context = makeContext(permission: .denied, userTorEnabled: true, torEnforced: true, torIsReady: false)
+
+        context.manager.subscribe(filter: makeFilter(), id: "stale-pending-sub", relayUrls: [relayURL], handler: { _ in })
+        XCTAssertEqual(context.manager.debugPendingSubscriptionCount(for: relayURL), 1)
+
+        // Just under the TTL the entry survives a connect attempt.
+        context.clock.now = context.clock.now.addingTimeInterval(TransportConfig.nostrPendingSubscriptionTTLSeconds - 1)
+        context.manager.ensureConnections(to: [relayURL])
+        XCTAssertEqual(context.manager.debugPendingSubscriptionCount(for: relayURL), 1)
+
+        // Past the TTL the next connect attempt sweeps it.
+        context.clock.now = context.clock.now.addingTimeInterval(2)
+        context.manager.ensureConnections(to: [relayURL])
+        XCTAssertEqual(context.manager.debugPendingSubscriptionCount(for: relayURL), 0)
+    }
+
+    func test_reconnectBackoff_appliesJitterWithinConfiguredBounds() async {
+        let relayURL = "wss://jitter-bounds.example"
+        // Pin the jitter source to the extremes and the midpoint of [0, 1).
+        let jitter = JitterSequence([0.0, 1.0.nextDown, 0.25])
+        let context = makeContext(permission: .denied, jitterUnit: { jitter.next() })
+        // Persistent ping failure: every connect attempt fails and schedules
+        // the next reconnect with an increasing attempt count.
+        context.sessionFactory.pingErrorByURL[relayURL] = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+
+        context.manager.ensureConnections(to: [relayURL])
+
+        var delays: [TimeInterval] = []
+        for attempt in 1...3 {
+            let scheduled = await waitUntil { context.scheduler.scheduled.count == 1 }
+            XCTAssertTrue(scheduled, "reconnect for attempt \(attempt) was not scheduled")
+            delays.append(context.scheduler.scheduled[0].delay)
+            context.scheduler.runNext()
+        }
+
+        // Bases: 1s, 2s, 4s. Jitter factors: 0.8, ~1.2, 0.9.
+        XCTAssertEqual(delays[0], 0.8 * TransportConfig.nostrRelayInitialBackoffSeconds, accuracy: 1e-9)
+        XCTAssertEqual(delays[1], 1.2 * TransportConfig.nostrRelayInitialBackoffSeconds * TransportConfig.nostrRelayBackoffMultiplier, accuracy: 1e-6)
+        XCTAssertEqual(delays[2], 0.9 * TransportConfig.nostrRelayInitialBackoffSeconds * pow(TransportConfig.nostrRelayBackoffMultiplier, 2), accuracy: 1e-9)
+    }
+
+    func test_reconnectBackoff_realRandomJitterStaysInBoundsAndVaries() async {
+        let relayURL = "wss://jitter-random.example"
+        let context = makeContext(permission: .denied, jitterUnit: { Double.random(in: 0..<1) })
+        context.sessionFactory.pingErrorByURL[relayURL] = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+
+        context.manager.ensureConnections(to: [relayURL])
+
+        var factors: [Double] = []
+        for attempt in 1...5 {
+            let scheduled = await waitUntil { context.scheduler.scheduled.count == 1 }
+            XCTAssertTrue(scheduled, "reconnect for attempt \(attempt) was not scheduled")
+            let base = min(
+                TransportConfig.nostrRelayInitialBackoffSeconds * pow(TransportConfig.nostrRelayBackoffMultiplier, Double(attempt - 1)),
+                TransportConfig.nostrRelayMaxBackoffSeconds
+            )
+            let factor = context.scheduler.scheduled[0].delay / base
+            XCTAssertGreaterThanOrEqual(factor, 1.0 - TransportConfig.nostrRelayBackoffJitterRatio)
+            XCTAssertLessThan(factor, 1.0 + TransportConfig.nostrRelayBackoffJitterRatio)
+            factors.append(factor)
+            context.scheduler.runNext()
+        }
+
+        // A real RNG must not produce a constant delay across attempts
+        // (5 identical uniform doubles is probability ~0).
+        XCTAssertGreaterThan(Set(factors).count, 1)
+    }
+
     private func makeContext(
         permission: LocationChannelManager.PermissionState,
         favorites: Set<Data> = [],
@@ -1011,7 +1387,8 @@ final class NostrRelayManagerTests: XCTestCase {
         userTorEnabled: Bool = false,
         torEnforced: Bool = false,
         torIsReady: Bool = true,
-        torIsForeground: Bool = true
+        torIsForeground: Bool = true,
+        jitterUnit: @escaping () -> Double = { 0.5 } // 0.5 -> jitter factor 1.0 (no jitter)
     ) -> RelayManagerTestContext {
         let permissionSubject = CurrentValueSubject<LocationChannelManager.PermissionState, Never>(permission)
         let favoritesSubject = CurrentValueSubject<Set<Data>, Never>(favorites)
@@ -1037,7 +1414,8 @@ final class NostrRelayManagerTests: XCTestCase {
                 scheduleAfter: { delay, action in
                     scheduler.schedule(delay: delay, action: action)
                 },
-                now: { clock.now }
+                now: { clock.now },
+                jitterUnit: jitterUnit
             )
         )
         return RelayManagerTestContext(
@@ -1111,6 +1489,20 @@ private final class MutableClock {
 
     init(now: Date) {
         self.now = now
+    }
+}
+
+/// Deterministic jitter source: returns the queued values in order, then a
+/// neutral 0.5 (jitter factor 1.0) once exhausted.
+private final class JitterSequence {
+    private var values: [Double]
+
+    init(_ values: [Double]) {
+        self.values = values
+    }
+
+    func next() -> Double {
+        values.isEmpty ? 0.5 : values.removeFirst()
     }
 }
 
@@ -1222,9 +1614,22 @@ private final class MockRelayConnection: NostrRelayConnectionProtocol {
         cancelCallCount += 1
     }
 
+    var deferSendCompletions = false
+    private var deferredSendCompletions: [(Error?) -> Void] = []
+
     func send(_ message: URLSessionWebSocketTask.Message, completionHandler: @escaping (Error?) -> Void) {
         sentMessages.append(message)
-        completionHandler(sendError)
+        if deferSendCompletions {
+            deferredSendCompletions.append(completionHandler)
+        } else {
+            completionHandler(sendError)
+        }
+    }
+
+    func flushDeferredSendCompletions() {
+        let pending = deferredSendCompletions
+        deferredSendCompletions = []
+        pending.forEach { $0(sendError) }
     }
 
     func receive(completionHandler: @escaping (Result<URLSessionWebSocketTask.Message, Error>) -> Void) {

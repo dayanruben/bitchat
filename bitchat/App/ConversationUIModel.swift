@@ -15,19 +15,19 @@ final class ConversationUIModel: ObservableObject {
 
     private let chatViewModel: ChatViewModel
     private let privateConversationModel: PrivateConversationModel
-    private let conversationStore: ConversationStore
+    private let conversations: ConversationStore
     private var activeChannel: ChannelID
     private var cancellables = Set<AnyCancellable>()
 
     init(
         chatViewModel: ChatViewModel,
         privateConversationModel: PrivateConversationModel,
-        conversationStore: ConversationStore
+        conversations: ConversationStore
     ) {
         self.chatViewModel = chatViewModel
         self.privateConversationModel = privateConversationModel
-        self.conversationStore = conversationStore
-        self.activeChannel = conversationStore.activeChannel
+        self.conversations = conversations
+        self.activeChannel = conversations.activeChannel
         self.currentNickname = chatViewModel.nickname
         self.isBatchingPublic = chatViewModel.isBatchingPublic
         self.showAutocomplete = chatViewModel.showAutocomplete
@@ -39,6 +39,10 @@ final class ConversationUIModel: ObservableObject {
 
     func setCurrentColorScheme(_ colorScheme: ColorScheme) {
         chatViewModel.currentColorScheme = colorScheme
+    }
+
+    func setCurrentTheme(_ theme: AppTheme) {
+        chatViewModel.currentTheme = theme
     }
 
     func sendMessage(_ message: String) {
@@ -76,12 +80,12 @@ final class ConversationUIModel: ObservableObject {
         chatViewModel.completeNickname(nickname, in: &text)
     }
 
-    func formatMessage(_ message: BitchatMessage, colorScheme: ColorScheme) -> AttributedString {
-        chatViewModel.formatMessageAsText(message, colorScheme: colorScheme)
+    func formatMessage(_ message: BitchatMessage, colorScheme: ColorScheme, theme: AppTheme? = nil) -> AttributedString {
+        chatViewModel.formatMessageAsText(message, colorScheme: colorScheme, theme: theme)
     }
 
-    func formatMessageHeader(_ message: BitchatMessage, colorScheme: ColorScheme) -> AttributedString {
-        chatViewModel.formatMessageHeader(message, colorScheme: colorScheme)
+    func formatMessageHeader(_ message: BitchatMessage, colorScheme: ColorScheme, theme: AppTheme? = nil) -> AttributedString {
+        chatViewModel.formatMessageHeader(message, colorScheme: colorScheme, theme: theme)
     }
 
     func mediaAttachment(for message: BitchatMessage) -> BitchatMessage.Media? {
@@ -151,7 +155,7 @@ final class ConversationUIModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .assign(to: &$isBatchingPublic)
 
-        conversationStore.$activeChannel
+        conversations.$activeChannel
             .receive(on: DispatchQueue.main)
             .sink { [weak self] channel in
                 self?.activeChannel = channel

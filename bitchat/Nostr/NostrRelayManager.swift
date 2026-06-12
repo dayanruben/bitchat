@@ -66,6 +66,9 @@ struct NostrRelayManagerDependencies {
     var makeSession: () -> NostrRelaySessionProtocol
     var scheduleAfter: @Sendable (TimeInterval, @escaping @Sendable () -> Void) -> Void
     var now: () -> Date
+    /// Uniform random value in [0, 1) used to jitter reconnect backoff.
+    /// Injectable so tests can pin or sweep the jitter deterministically.
+    var jitterUnit: () -> Double
 }
 
 private extension NostrRelayManagerDependencies {
@@ -93,7 +96,8 @@ private extension NostrRelayManagerDependencies {
             scheduleAfter: { delay, action in
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
             },
-            now: Date.init
+            now: Date.init,
+            jitterUnit: { Double.random(in: 0..<1) }
         )
     }
 }
@@ -140,7 +144,16 @@ final class NostrRelayManager: ObservableObject {
     private var hasLocationPermission: Bool = false
     private var connections: [String: NostrRelayConnectionProtocol] = [:]
     private var subscriptions: [String: Set<String>] = [:] // relay URL -> active subscription IDs
-    private var pendingSubscriptions: [String: [String: String]] = [:] // relay URL -> (subscription id -> encoded REQ JSON)
+    // Not-yet-flushed REQs per relay, bounded by a per-relay cap (oldest by
+    // insertion order evicted) and an age sweep on connect attempts. Dicts are
+    // unordered, so each entry carries an insertion sequence and queue time.
+    private struct PendingSubscription {
+        let messageString: String // encoded REQ JSON
+        let queuedAt: Date
+        let sequence: UInt64
+    }
+    private var pendingSubscriptions: [String: [String: PendingSubscription]] = [:] // relay URL -> (subscription id -> pending REQ)
+    private var pendingSubscriptionSequence: UInt64 = 0
     private var messageHandlers: [String: (NostrEvent) -> Void] = [:]
     private struct InboundEventKey: Hashable {
         let subscriptionID: String
@@ -152,6 +165,7 @@ final class NostrRelayManager: ObservableObject {
     private var recentInboundEventKeyOrder: [InboundEventKey] = []
     private var duplicateInboundEventDropCount = 0
     private var duplicateInboundEventDropCountBySubscription: [String: Int] = [:]
+    private var inboundEventLogCount = 0
     // Coalesce duplicate subscribe requests for the same id within a short window.
     private let subscribeCoalesceInterval: TimeInterval = 1.0
     private var subscribeCoalesce: [String: Date] = [:]
@@ -170,9 +184,10 @@ final class NostrRelayManager: ObservableObject {
     private struct EOSETracker {
         var pendingRelays: Set<String>
         var callback: () -> Void
-        var timer: Timer?
+        let epoch: Int
     }
     private var eoseTrackers: [String: EOSETracker] = [:]
+    private var eoseTrackerEpoch = 0
     private var pendingEOSECallbacks: [String: () -> Void] = [:]
     
     // Message queue for reliability
@@ -183,6 +198,9 @@ final class NostrRelayManager: ObservableObject {
     }
     private var messageQueue: [PendingSend] = []
     private let messageQueueLock = NSLock()
+    // Total pending sends dropped at the queue cap; drives the sampled
+    // overflow warning (first + every Nth drop).
+    private var pendingSendDropCount = 0
     private let encoder = JSONEncoder()
     private var shouldUseTor: Bool { dependencies.userTorEnabled() }
     
@@ -263,15 +281,18 @@ final class NostrRelayManager: ObservableObject {
             task.cancel(with: .goingAway, reason: nil)
         }
         connections.removeAll()
-        // Clear known subscriptions and any queued subs since connections are gone
+        // Sockets are gone, so per-relay subscription state is cleared — but
+        // durable intent (subscriptionRequestState, messageHandlers, parked
+        // EOSE callbacks) is kept so REQs replay when relays reconnect
+        // (e.g. background → foreground).
         subscriptions.removeAll()
         pendingSubscriptions.removeAll()
-        subscriptionRequestState.removeAll()
-        pendingEOSECallbacks.removeAll()
-        for (_, tracker) in eoseTrackers {
-            tracker.timer?.invalidate()
-        }
+        // Settle in-flight initial loads instead of leaving callers hanging.
+        let trackers = eoseTrackers
         eoseTrackers.removeAll()
+        for (_, tracker) in trackers {
+            tracker.callback()
+        }
         pendingTorConnectionURLs.removeAll()
         awaitingTorForConnections = false
         torReadyWaitAttempts = 0
@@ -334,6 +355,18 @@ final class NostrRelayManager: ObservableObject {
             messageQueue.removeFirst(overflow)
         }
         messageQueueLock.unlock()
+        guard overflow > 0 else { return }
+        // Dropped events are ephemeral (presence/geo), so no status surfacing
+        // is needed — but the drops should be visible. Sampled so a sustained
+        // relay stall can't flood the log.
+        pendingSendDropCount += overflow
+        if pendingSendDropCount == 1 ||
+            pendingSendDropCount.isMultiple(of: TransportConfig.nostrPendingSendDropLogInterval) {
+            SecureLogger.warning(
+                "📤 Relay send queue full — dropped \(pendingSendDropCount) oldest event(s)",
+                category: .session
+            )
+        }
     }
 
     /// Try to flush any queued messages for relays that are now connected.
@@ -427,16 +460,14 @@ final class NostrRelayManager: ObservableObject {
                 existingSet.insert(url)
             }
             for url in urls {
-                var map = self.pendingSubscriptions[url] ?? [:]
-                map[id] = messageString
-                self.pendingSubscriptions[url] = map
+                queuePendingSubscription(id: id, messageString: messageString, for: url)
             }
             // Initialize EOSE tracking if requested
             if let onEOSE = onEOSE {
                 if urls.isEmpty {
                     onEOSE()
                 } else if shouldWaitForTorBeforeConnecting {
-                    pendingEOSECallbacks[id] = onEOSE
+                    parkEOSECallbackUntilTorReady(id: id, callback: onEOSE)
                 } else {
                     startEOSETracking(id: id, relayURLs: Set(urls), callback: onEOSE)
                 }
@@ -515,7 +546,6 @@ final class NostrRelayManager: ObservableObject {
         subscribeCoalesce.removeValue(forKey: id)
         subscriptionRequestState.removeValue(forKey: id)
         pendingEOSECallbacks.removeValue(forKey: id)
-        eoseTrackers[id]?.timer?.invalidate()
         eoseTrackers.removeValue(forKey: id)
         for url in Array(pendingSubscriptions.keys) {
             pendingSubscriptions[url]?.removeValue(forKey: id)
@@ -546,6 +576,7 @@ final class NostrRelayManager: ObservableObject {
 
     private func connectToRelays(_ relayUrls: [String], shouldLog: Bool = false) {
         guard dependencies.activationAllowed() else { return }
+        sweepStalePendingSubscriptions()
         let targets = allowedRelayList(from: relayUrls).filter {
             connections[$0] == nil && !isPermanentlyFailed($0)
         }
@@ -607,6 +638,31 @@ final class NostrRelayManager: ObservableObject {
         }
     }
 
+    /// Park an EOSE callback while Tor is not yet ready, and schedule the same
+    /// fallback timeout `startEOSETracking` uses. Without it, a parked callback
+    /// would only be unblocked by Tor-readiness retry exhaustion (several
+    /// awaitReady timeouts, i.e. minutes), leaving callers hanging far past the
+    /// normal EOSE fallback. If Tor recovers first the callback is promoted to
+    /// a real EOSE tracker (`startPendingEOSETrackingIfNeeded`), and if retry
+    /// exhaustion fires first it is drained by `unblockPendingEOSECallbacks`;
+    /// either way it leaves `pendingEOSECallbacks` and this timer is a no-op.
+    private func parkEOSECallbackUntilTorReady(id: String, callback: @escaping () -> Void) {
+        pendingEOSECallbacks[id] = callback
+        let generation = connectionGeneration
+        dependencies.scheduleAfter(TransportConfig.nostrSubscriptionEOSEFallbackSeconds) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // Stale timers from a previous connection generation are void.
+                guard generation == self.connectionGeneration else { return }
+                // Already fired (unsubscribe, retry-exhaustion unblock) or
+                // promoted to a real EOSE tracker: nothing to do.
+                guard let callback = self.pendingEOSECallbacks.removeValue(forKey: id) else { return }
+                SecureLogger.warning("Unblocking Tor-parked EOSE callback for \(id) after fallback timeout", category: .session)
+                callback()
+            }
+        }
+    }
+
     /// Fire and clear all EOSE callbacks that are parked waiting for Tor.
     /// Callers treat EOSE as "initial fetch finished"; firing with no data is
     /// safe and prevents indefinite hangs when Tor cannot bootstrap.
@@ -623,26 +679,73 @@ final class NostrRelayManager: ObservableObject {
     private func subscriptionStateExists(id: String, requestState: SubscriptionRequestState) -> Bool {
         guard !requestState.relayURLs.isEmpty else { return true }
         return requestState.relayURLs.allSatisfy { url in
-            pendingSubscriptions[url]?[id] == requestState.messageString ||
+            pendingSubscriptions[url]?[id]?.messageString == requestState.messageString ||
                 subscriptions[url]?.contains(id) == true
         }
     }
 
+    private func queuePendingSubscription(id: String, messageString: String, for url: String) {
+        var map = pendingSubscriptions[url] ?? [:]
+        pendingSubscriptionSequence &+= 1
+        map[id] = PendingSubscription(
+            messageString: messageString,
+            queuedAt: dependencies.now(),
+            sequence: pendingSubscriptionSequence
+        )
+        // Bound per-relay pending REQs; evict oldest by insertion order. The
+        // durable intent stays in subscriptionRequestState, so an evicted REQ
+        // is still replayed if its subscription is active when the relay
+        // (re)connects.
+        var evictedCount = 0
+        while map.count > TransportConfig.nostrPendingSubscriptionsPerRelayCap,
+              let oldest = map.min(by: { $0.value.sequence < $1.value.sequence }) {
+            map.removeValue(forKey: oldest.key)
+            evictedCount += 1
+        }
+        if evictedCount > 0 {
+            // Bounds proof: the cap eviction actually removed entries.
+            SecureLogger.warning(
+                "📋 Evicted \(evictedCount) pending sub(s) over cap for \(url)",
+                category: .session
+            )
+        }
+        pendingSubscriptions[url] = map
+    }
+
+    /// Drop pending REQs older than the TTL. Runs on connect attempts (the
+    /// natural maintenance path: connect/ensureConnections/reconnects all
+    /// funnel through connectToRelays) so stale entries for relays that never
+    /// come up cannot accumulate without bound.
+    private func sweepStalePendingSubscriptions() {
+        let now = dependencies.now()
+        for (url, map) in pendingSubscriptions {
+            let fresh = map.filter {
+                now.timeIntervalSince($0.value.queuedAt) <= TransportConfig.nostrPendingSubscriptionTTLSeconds
+            }
+            guard fresh.count != map.count else { continue }
+            // Bounds proof: the age sweep actually removed entries. Warning
+            // (not debug) — stale pending REQs mean a relay never came up.
+            SecureLogger.warning(
+                "📋 Swept \(map.count - fresh.count) stale pending sub(s) for \(url)",
+                category: .session
+            )
+            pendingSubscriptions[url] = fresh.isEmpty ? nil : fresh
+        }
+    }
+
     private func startEOSETracking(id: String, relayURLs: Set<String>, callback: @escaping () -> Void) {
-        eoseTrackers[id]?.timer?.invalidate()
-        var tracker = EOSETracker(pendingRelays: relayURLs, callback: callback, timer: nil)
+        eoseTrackerEpoch += 1
+        let epoch = eoseTrackerEpoch
+        eoseTrackers[id] = EOSETracker(pendingRelays: relayURLs, callback: callback, epoch: epoch)
         // Fallback timeout to avoid hanging if a relay never sends EOSE.
-        tracker.timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
-            Task { @MainActor in
+        dependencies.scheduleAfter(TransportConfig.nostrSubscriptionEOSEFallbackSeconds) { [weak self] in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
-                if let tracker = self.eoseTrackers[id] {
-                    tracker.timer?.invalidate()
-                    self.eoseTrackers.removeValue(forKey: id)
-                    callback()
-                }
+                guard let tracker = self.eoseTrackers[id], tracker.epoch == epoch else { return }
+                self.eoseTrackers.removeValue(forKey: id)
+                tracker.callback()
             }
         }
-        eoseTrackers[id] = tracker
     }
 
     private func startPendingEOSETrackingIfNeeded(id: String) {
@@ -763,26 +866,35 @@ final class NostrRelayManager: ObservableObject {
         }
     }
 
-    /// Send any queued subscriptions for a relay that just connected.
+    /// Send queued subscriptions and replay durable ones for a relay that just
+    /// (re)connected. Relays drop subscriptions with the socket, so every
+    /// active subscription targeting this relay must be re-sent.
     private func flushPendingSubscriptions(for relayUrl: String) {
-        guard let map = pendingSubscriptions[relayUrl], !map.isEmpty else { return }
         guard let connection = connections[relayUrl] else { return }
-        for (id, messageString) in map {
+        var toSend = (pendingSubscriptions[relayUrl] ?? [:]).mapValues(\.messageString)
+        for (id, state) in subscriptionRequestState where state.relayURLs.contains(relayUrl) && toSend[id] == nil {
+            toSend[id] = state.messageString
+        }
+        for (id, messageString) in toSend {
             if self.subscriptions[relayUrl]?.contains(id) == true { continue }
             startPendingEOSETrackingIfNeeded(id: id)
-            connection.send(.string(messageString)) { error in
-                if let error = error {
-                    SecureLogger.error("❌ Failed to send pending subscription to \(relayUrl): \(error)", category: .session)
-                } else {
-                    Task { @MainActor in
-                        var subs = self.subscriptions[relayUrl] ?? Set<String>()
-                        subs.insert(id)
-                        self.subscriptions[relayUrl] = subs
+            connection.send(.string(messageString)) { [weak self, weak connection] error in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if let error = error {
+                        // Keep the pending entry; the next (re)connect retries it.
+                        SecureLogger.error("❌ Failed to send pending subscription to \(relayUrl): \(error)", category: .session)
+                    } else {
+                        // A stale completion from a socket that has since been
+                        // replaced must not mark the subscription active, or
+                        // the next connection would skip replaying it.
+                        guard let connection, self.connections[relayUrl] === connection else { return }
+                        self.subscriptions[relayUrl, default: []].insert(id)
+                        self.pendingSubscriptions[relayUrl]?.removeValue(forKey: id)
                     }
                 }
             }
         }
-        pendingSubscriptions[relayUrl] = nil
     }
     
     private func receiveMessage(from task: NostrRelayConnectionProtocol, relayUrl: String) {
@@ -834,7 +946,11 @@ final class NostrRelayManager: ObservableObject {
                 return
             }
             if event.kind != 1059 {
-                SecureLogger.debug("📥 Event kind=\(event.kind) id=\(event.id.prefix(16))… relay=\(relayUrl)", category: .session)
+                // Per-event logging floods dev builds in busy geohashes; sample it.
+                inboundEventLogCount += 1
+                if inboundEventLogCount == 1 || inboundEventLogCount.isMultiple(of: TransportConfig.nostrInboundEventLogInterval) {
+                    SecureLogger.debug("📥 Event #\(inboundEventLogCount) kind=\(event.kind) id=\(event.id.prefix(16))… relay=\(relayUrl)", category: .session)
+                }
             }
             if let handler = self.messageHandlers[subId] {
                 handler(event)
@@ -845,7 +961,6 @@ final class NostrRelayManager: ObservableObject {
             if var tracker = eoseTrackers[subId] {
                 tracker.pendingRelays.remove(relayUrl)
                 if tracker.pendingRelays.isEmpty {
-                    tracker.timer?.invalidate()
                     eoseTrackers.removeValue(forKey: subId)
                     tracker.callback()
                 } else {
@@ -919,17 +1034,30 @@ final class NostrRelayManager: ObservableObject {
         isConnected = relays.contains { $0.isConnected }
     }
     
-    private func handleDisconnection(relayUrl: String, error: Error) {
-        // If networking is disallowed, do not schedule reconnection
-        if !dependencies.activationAllowed() {
-            connections.removeValue(forKey: relayUrl)
-            subscriptions.removeValue(forKey: relayUrl)
-            updateRelayStatus(relayUrl, isConnected: false, error: error)
-            return
+    /// A relay that drops before sending EOSE must not stall initial-load
+    /// callbacks; treat it as done and let the remaining relays (or the
+    /// fallback timeout) drive completion.
+    private func settleEOSETrackers(droppingRelay relayUrl: String) {
+        for (id, var tracker) in eoseTrackers where tracker.pendingRelays.contains(relayUrl) {
+            tracker.pendingRelays.remove(relayUrl)
+            if tracker.pendingRelays.isEmpty {
+                eoseTrackers.removeValue(forKey: id)
+                tracker.callback()
+            } else {
+                eoseTrackers[id] = tracker
+            }
         }
+    }
+
+    private func handleDisconnection(relayUrl: String, error: Error) {
         connections.removeValue(forKey: relayUrl)
         subscriptions.removeValue(forKey: relayUrl)
         updateRelayStatus(relayUrl, isConnected: false, error: error)
+        settleEOSETrackers(droppingRelay: relayUrl)
+        // If networking is disallowed, do not schedule reconnection
+        if !dependencies.activationAllowed() {
+            return
+        }
         
         // Check if this is a DNS or handshake error; treat as permanent
         let errorDescription = error.localizedDescription.lowercased()
@@ -960,16 +1088,26 @@ final class NostrRelayManager: ObservableObject {
             return
         }
         
-        // Calculate backoff interval
-        let backoffInterval = min(
+        // Calculate backoff interval with ±jitterRatio random jitter so relays
+        // that dropped together don't all reconnect at the same instant.
+        let baseBackoffInterval = min(
             initialBackoffInterval * pow(backoffMultiplier, Double(relays[index].reconnectAttempts - 1)),
             maxBackoffInterval
         )
-        
+        let jitterRatio = TransportConfig.nostrRelayBackoffJitterRatio
+        let jitterFactor = 1.0 + (dependencies.jitterUnit() * 2.0 - 1.0) * jitterRatio
+        let backoffInterval = baseBackoffInterval * jitterFactor
+
         let nextReconnectTime = dependencies.now().addingTimeInterval(backoffInterval)
         relays[index].nextReconnectTime = nextReconnectTime
-        
-        
+
+        // Reconnects are bounded by maxReconnectAttempts and exponentially
+        // backed off, so this is low-frequency: plain debug, no sampling.
+        SecureLogger.debug(
+            "🔄 Reconnect \(relayUrl) in \(String(format: "%.1f", backoffInterval))s (base \(String(format: "%.1f", baseBackoffInterval))s, attempt \(relays[index].reconnectAttempts)/\(maxReconnectAttempts))",
+            category: .session
+        )
+
         // Schedule reconnection with exponential backoff
         let gen = connectionGeneration
         dependencies.scheduleAfter(backoffInterval) { [weak self] in
@@ -1027,6 +1165,11 @@ final class NostrRelayManager: ObservableObject {
         pendingSubscriptions[relayUrl]?.count ?? 0
     }
 
+    func debugPendingSubscriptionIDs(for relayUrl: String) -> Set<String> {
+        guard let map = pendingSubscriptions[relayUrl] else { return [] }
+        return Set(map.keys)
+    }
+
     var debugDuplicateInboundEventDropCount: Int {
         duplicateInboundEventDropCount
     }
@@ -1059,6 +1202,13 @@ final class NostrRelayManager: ObservableObject {
     // MARK: - Failure classification
     private func isPermanentlyFailed(_ url: String) -> Bool {
         guard let r = relays.first(where: { $0.url == url }) else { return false }
+        // Failures decay: after a cooldown the relay gets another chance, so a
+        // long network outage or transient relay trouble can't blacklist it
+        // for the rest of the process lifetime.
+        if let lastDisconnect = r.lastDisconnectedAt,
+           dependencies.now().timeIntervalSince(lastDisconnect) >= TransportConfig.nostrRelayFailureCooldownSeconds {
+            return false
+        }
         if r.reconnectAttempts >= maxReconnectAttempts { return true }
         if let ns = r.lastError as NSError?, ns.domain == NSURLErrorDomain {
             if ns.code == NSURLErrorBadServerResponse || ns.code == NSURLErrorCannotFindHost {
