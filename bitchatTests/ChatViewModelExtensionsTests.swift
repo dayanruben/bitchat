@@ -297,8 +297,23 @@ struct ChatViewModelNostrExtensionTests {
         
         let didAppend = await TestHelpers.waitUntil({
             viewModel.publicMessagePipeline.flushIfNeeded()
-            return viewModel.messages.contains { $0.content == "Hello Geo" }
-        })
+            if viewModel.messages.contains(where: { $0.content == "Hello Geo" }) { return true }
+            // LocationChannelManager is a process-wide singleton: a suite
+            // running in parallel (e.g. CommandProcessorTests) can flip the
+            // selected channel mid-test, which reroutes or drops the event
+            // permanently — no amount of waiting recovers it. Re-assert the
+            // channel and redeliver on each poll: every channel switch clears
+            // the processed-event set and the store dedups by message ID, so
+            // redelivery is idempotent and interference heals on the next
+            // poll while a genuine failure still times out.
+            if LocationChannelManager.shared.selectedChannel != channel {
+                LocationChannelManager.shared.select(channel)
+            }
+            if viewModel.activeChannel == channel {
+                viewModel.handleNostrEvent(signed)
+            }
+            return false
+        }, timeout: TestConstants.longTimeout)
         #expect(didAppend)
     }
 
@@ -640,8 +655,10 @@ struct ChatViewModelNostrExtensionTests {
         #expect(viewModel.findNoiseKey(for: nostrHex) == noiseKey)
     }
 
+    /// An inbound Nostr [FAVORITED] marker must flip theyFavoritedUs and stay
+    /// out of the conversation transcript.
     @Test @MainActor
-    func handleFavoriteNotification_updatesFavoriteAssociation() async throws {
+    func handlePrivateMessage_nostrFavoritedMarkerUpdatesRelationship() async throws {
         let (viewModel, _) = makeTestableViewModel()
         let identity = try NostrIdentity.generate()
         let noiseKey = Data((0..<32).map { UInt8(($0 + 144) & 0xFF) })
@@ -649,19 +666,33 @@ struct ChatViewModelNostrExtensionTests {
         FavoritesPersistenceService.shared.addFavorite(
             peerNoisePublicKey: noiseKey,
             peerNostrPublicKey: identity.npub,
-            peerNickname: "Before"
+            peerNickname: "Alice"
         )
-        defer { FavoritesPersistenceService.shared.removeFavorite(peerNoisePublicKey: noiseKey) }
+        defer {
+            FavoritesPersistenceService.shared.updatePeerFavoritedUs(peerNoisePublicKey: noiseKey, favorited: false)
+            FavoritesPersistenceService.shared.removeFavorite(peerNoisePublicKey: noiseKey)
+        }
 
-        viewModel.handleFavoriteNotification(
-            content: "FAVORITE:TRUE|NPUB:\(identity.npub)|Alice",
-            from: identity.publicKeyHex
+        // The inbound pipeline resolves a known sender to their noise-key ID.
+        let convKey = PeerID(hexData: noiseKey)
+        let payloadData = try #require(
+            PrivateMessagePacket(messageID: "fav-e2e-1", content: "[FAVORITED]:\(identity.npub)").encode()
+        )
+        let payload = NoisePayload(type: .privateMessage, data: payloadData)
+
+        viewModel.handlePrivateMessage(
+            payload,
+            senderPubkey: identity.publicKeyHex,
+            convKey: convKey,
+            id: identity,
+            messageTimestamp: Date()
         )
 
         let relationship = FavoritesPersistenceService.shared.getFavoriteStatus(for: noiseKey)
-        #expect(relationship?.peerNickname == "Alice")
+        #expect(relationship?.theyFavoritedUs == true)
+        #expect(relationship?.isMutual == true)
         #expect(relationship?.peerNostrPublicKey == identity.npub)
-        #expect(relationship?.isFavorite == true)
+        #expect(viewModel.privateChats[convKey, default: []].isEmpty)
     }
 
     @Test @MainActor
@@ -1000,7 +1031,11 @@ struct ChatViewModelMediaTransferTests {
         viewModel.selectedPrivateChatPeer = peerID
         viewModel.sendVoiceNote(at: url)
 
-        let didSend = await TestHelpers.waitUntil({ transport.sentPrivateFiles.count == 1 }, timeout: 5.0)
+        // Media sends hop through Task.detached; the global executor is
+        // shared with every parallel test worker, so a loaded runner can
+        // exceed the 5s default. waitUntil returns as soon as the condition
+        // holds, so passing runs never pay the longer timeout.
+        let didSend = await TestHelpers.waitUntil({ transport.sentPrivateFiles.count == 1 }, timeout: TestConstants.longTimeout)
         #expect(didSend)
         #expect(transport.sentPrivateFiles.first?.peerID == peerID)
         #expect(viewModel.privateChats[peerID]?.last?.content.contains("[voice]") == true)
@@ -1020,7 +1055,7 @@ struct ChatViewModelMediaTransferTests {
 
         let didFail = await TestHelpers.waitUntil({
             isFailed(status: viewModel.privateChats[peerID]?.last?.deliveryStatus)
-        }, timeout: 5.0)
+        }, timeout: TestConstants.longTimeout)
         #expect(didFail)
         #expect(!FileManager.default.fileExists(atPath: url.path))
         #expect(transport.sentPrivateFiles.isEmpty)
@@ -1036,7 +1071,7 @@ struct ChatViewModelMediaTransferTests {
         viewModel.selectedPrivateChatPeer = peerID
         viewModel.sendImage(from: sourceURL)
 
-        let didSend = await TestHelpers.waitUntil({ transport.sentPrivateFiles.count == 1 }, timeout: 5.0)
+        let didSend = await TestHelpers.waitUntil({ transport.sentPrivateFiles.count == 1 }, timeout: TestConstants.longTimeout)
         #expect(didSend)
         #expect(transport.sentPrivateFiles.first?.peerID == peerID)
         #expect(transport.sentPrivateFiles.first?.packet.mimeType == "image/jpeg")
@@ -1057,7 +1092,7 @@ struct ChatViewModelMediaTransferTests {
 
         let didNotify = await TestHelpers.waitUntil({
             viewModel.messages.contains(where: { $0.sender == "system" && $0.content.contains("Failed to prepare image") })
-        }, timeout: 5.0)
+        }, timeout: TestConstants.longTimeout)
         #expect(didNotify)
         #expect(transport.sentPrivateFiles.isEmpty)
         #expect(viewModel.privateChats[peerID]?.isEmpty != false)

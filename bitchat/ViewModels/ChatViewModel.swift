@@ -764,15 +764,19 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         locationPresenceStore: LocationPresenceStore? = nil,
         locationManager: LocationChannelManager = .shared
     ) {
+        let meshService = BLEService(keychain: keychain, idBridge: idBridge, identityManager: identityManager)
+        meshService.sfMetrics = .shared
         self.init(
             keychain: keychain,
             idBridge: idBridge,
             identityManager: identityManager,
-            transport: BLEService(keychain: keychain, idBridge: idBridge, identityManager: identityManager),
+            transport: meshService,
             conversations: conversations,
             peerIdentityStore: peerIdentityStore ?? PeerIdentityStore(),
             locationPresenceStore: locationPresenceStore ?? LocationPresenceStore(),
-            locationManager: locationManager
+            locationManager: locationManager,
+            outboxStore: MessageOutboxStore(keychain: keychain),
+            sfMetrics: .shared
         )
     }
 
@@ -788,7 +792,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         peerIdentityStore: PeerIdentityStore? = nil,
         locationPresenceStore: LocationPresenceStore? = nil,
         locationManager: LocationChannelManager = .shared,
-        readReceiptsDefaults: UserDefaults? = nil
+        readReceiptsDefaults: UserDefaults? = nil,
+        outboxStore: MessageOutboxStore? = nil,
+        sfMetrics: StoreAndForwardMetrics? = nil
     ) {
         let conversations = conversations ?? ConversationStore()
         let peerIdentityStore = peerIdentityStore ?? PeerIdentityStore()
@@ -797,7 +803,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
             keychain: keychain,
             idBridge: idBridge,
             identityManager: identityManager,
-            meshService: transport
+            meshService: transport,
+            outboxStore: outboxStore,
+            sfMetrics: sfMetrics
         )
 
         self.keychain = keychain
@@ -988,6 +996,48 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         )
     }
 
+    // Mesh (Noise identity) block helpers. Unlike the `/block <nickname>`
+    // command, these resolve and persist the block by the peer's stable
+    // fingerprint (derived from `peerID`), so the exact tapped peer is
+    // (un)blocked — unambiguous across nickname collisions and functional for
+    // offline peers that can no longer be resolved through the mesh service.
+    @MainActor
+    func blockMeshPeer(peerID: PeerID, displayName: String) {
+        setMeshPeerBlocked(peerID, blocked: true, displayName: displayName)
+    }
+
+    @MainActor
+    func unblockMeshPeer(peerID: PeerID, displayName: String) {
+        setMeshPeerBlocked(peerID, blocked: false, displayName: displayName)
+    }
+
+    @MainActor
+    private func setMeshPeerBlocked(_ peerID: PeerID, blocked: Bool, displayName: String) {
+        guard unifiedPeerService.setBlocked(peerID, blocked: blocked) != nil else {
+            addCommandOutput(
+                String(
+                    format: String(
+                        localized: blocked ? "system.mesh.block_failed" : "system.mesh.unblock_failed",
+                        comment: "System message shown when a mesh peer cannot be blocked or unblocked"
+                    ),
+                    locale: .current,
+                    displayName
+                )
+            )
+            return
+        }
+        addCommandOutput(
+            String(
+                format: String(
+                    localized: blocked ? "system.mesh.blocked" : "system.mesh.unblocked",
+                    comment: "System message shown when a mesh peer is blocked or unblocked"
+                ),
+                locale: .current,
+                displayName
+            )
+        )
+    }
+
     func displayNameForNostrPubkey(_ pubkeyHex: String) -> String {
         publicConversationCoordinator.displayNameForNostrPubkey(pubkeyHex)
     }
@@ -1146,6 +1196,14 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
 
         // Clear persistent favorites from keychain
         FavoritesPersistenceService.shared.clearAllFavorites()
+
+        // Drop courier mail carried for third parties (memory and disk),
+        // our own queued outbox, the carried public history, and the
+        // counters describing all of it
+        CourierStore.shared.wipe()
+        messageRouter.wipeOutbox()
+        GossipMessageArchive.wipeDefault()
+        StoreAndForwardMetrics.shared.reset()
 
         // Identity manager has cleared persisted identity data above
 

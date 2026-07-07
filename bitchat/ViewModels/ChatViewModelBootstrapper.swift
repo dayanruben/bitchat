@@ -17,7 +17,9 @@ struct ChatViewModelServiceBundle {
         keychain: KeychainManagerProtocol,
         idBridge: NostrIdentityBridge,
         identityManager: SecureIdentityStateManagerProtocol,
-        meshService: Transport
+        meshService: Transport,
+        outboxStore: MessageOutboxStore? = nil,
+        sfMetrics: StoreAndForwardMetrics? = nil
     ) {
         let commandProcessor = CommandProcessor(identityManager: identityManager)
         let privateChatManager = PrivateChatManager(meshService: meshService)
@@ -28,7 +30,11 @@ struct ChatViewModelServiceBundle {
         )
         let nostrTransport = NostrTransport(keychain: keychain, idBridge: idBridge)
         nostrTransport.senderPeerID = meshService.myPeerID
-        let messageRouter = MessageRouter(transports: [meshService, nostrTransport])
+        let messageRouter = MessageRouter(
+            transports: [meshService, nostrTransport],
+            outboxStore: outboxStore,
+            metrics: sfMetrics
+        )
 
         self.commandProcessor = commandProcessor
         self.messageRouter = messageRouter
@@ -100,9 +106,26 @@ private extension ChatViewModelBootstrapper {
                     category: .session
                 )
                 viewModel.conversations.setDeliveryStatus(
-                    .failed(reason: "Not delivered"),
+                    .failed(reason: String(localized: "content.delivery.reason.not_delivered", comment: "Failure reason shown when the router gave up delivering a message")),
                     forMessageID: messageID
                 )
+            }
+        }
+        // A message with no reachable transport that was handed to a courier
+        // shows a distinct "carried" state instead of sitting in "sending"
+        // forever. Never downgrade a confirmed receipt: the courier copy can
+        // race direct delivery when the peer reappears.
+        viewModel.messageRouter.onMessageCarried = { [weak viewModel] messageID, peerID in
+            guard let viewModel else { return }
+            switch viewModel.conversations.deliveryStatus(forMessageID: messageID) {
+            case .delivered, .read:
+                break
+            default:
+                SecureLogger.debug(
+                    "📦 Message \(messageID.prefix(8))… for \(peerID.id.prefix(8))… handed to courier → marked carried",
+                    category: .session
+                )
+                viewModel.conversations.setDeliveryStatus(.carried, forMessageID: messageID)
             }
         }
         viewModel.commandProcessor.contextProvider = viewModel
