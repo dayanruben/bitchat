@@ -117,7 +117,6 @@ final class NostrRelayManager: ObservableObject {
         let url: String
         var isConnected: Bool = false
         var lastError: Error?
-        var lastConnectedAt: Date?
         var messagesSent: Int = 0
         var messagesReceived: Int = 0
         var reconnectAttempts: Int = 0
@@ -184,11 +183,26 @@ final class NostrRelayManager: ObservableObject {
     }
     private var subscriptionRequestState: [String: SubscriptionRequestState] = [:]
 
-    // Track EOSE per subscription to signal when initial stored events are done
+    // Track EOSE per subscription to signal when initial stored events are
+    // done. Completion is scoped to relays the REQ actually reached: targets
+    // still mid-connect must not hold the callback hostage until the fallback
+    // timer (a dead relay of five used to pin "loading" for the full 10s).
     private struct EOSETracker {
-        var pendingRelays: Set<String>
+        /// Targets the REQ has not been delivered to yet (still connecting).
+        var awaitingSend: Set<String>
+        /// Relays that received the REQ and have not sent EOSE yet.
+        var awaitingEOSE: Set<String>
+        /// True once any relay received the REQ (or answered with EOSE) —
+        /// completion with zero sends would mean "done" without ever asking.
+        var didSend = false
         var callback: () -> Void
         let epoch: Int
+
+        /// Done when every relay that got the REQ has resolved, provided at
+        /// least one did — or when every target dropped out entirely.
+        var isComplete: Bool {
+            (didSend && awaitingEOSE.isEmpty) || (awaitingSend.isEmpty && awaitingEOSE.isEmpty)
+        }
     }
     private var eoseTrackers: [String: EOSETracker] = [:]
     private var eoseTrackerEpoch = 0
@@ -347,7 +361,6 @@ final class NostrRelayManager: ObservableObject {
             relays[index].nextReconnectTime = nil
             if resetState {
                 relays[index].lastError = nil
-                relays[index].lastConnectedAt = nil
                 relays[index].lastDisconnectedAt = nil
                 relays[index].messagesSent = 0
                 relays[index].messagesReceived = 0
@@ -795,7 +808,7 @@ final class NostrRelayManager: ObservableObject {
     private func startEOSETracking(id: String, relayURLs: Set<String>, callback: @escaping () -> Void) {
         eoseTrackerEpoch += 1
         let epoch = eoseTrackerEpoch
-        eoseTrackers[id] = EOSETracker(pendingRelays: relayURLs, callback: callback, epoch: epoch)
+        eoseTrackers[id] = EOSETracker(awaitingSend: relayURLs, awaitingEOSE: [], callback: callback, epoch: epoch)
         // Fallback timeout to avoid hanging if a relay never sends EOSE.
         dependencies.scheduleAfter(TransportConfig.nostrSubscriptionEOSEFallbackSeconds) { [weak self] in
             Task { @MainActor [weak self] in
@@ -935,8 +948,19 @@ final class NostrRelayManager: ObservableObject {
             toSend[id] = state.messageString
         }
         for (id, messageString) in toSend {
-            if self.subscriptions[relayUrl]?.contains(id) == true { continue }
+            if self.subscriptions[relayUrl]?.contains(id) == true {
+                // Already subscribed on this relay (e.g. a tracker promoted
+                // after an earlier flush): its EOSE is coming, count it.
+                markEOSESubscribed(id: id, relayUrl: relayUrl)
+                continue
+            }
             startPendingEOSETrackingIfNeeded(id: id)
+            // Mark at send *initiation*, not in the async completion: a fast
+            // relay's EOSE could otherwise complete the tracker while this
+            // relay — REQ already on the wire — still sat in awaitingSend.
+            // If the send fails the socket is going down with it, and the
+            // disconnect settle (or the fallback timer) releases the wait.
+            markEOSESubscribed(id: id, relayUrl: relayUrl)
             connection.send(.string(messageString)) { [weak self, weak connection] error in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
@@ -1018,8 +1042,12 @@ final class NostrRelayManager: ObservableObject {
             }
         case .eose(let subId):
             if var tracker = eoseTrackers[subId] {
-                tracker.pendingRelays.remove(relayUrl)
-                if tracker.pendingRelays.isEmpty {
+                // An EOSE proves the relay received the REQ even if the local
+                // send completion hasn't run yet.
+                tracker.awaitingSend.remove(relayUrl)
+                tracker.awaitingEOSE.remove(relayUrl)
+                tracker.didSend = true
+                if tracker.isComplete {
                     eoseTrackers.removeValue(forKey: subId)
                     tracker.callback()
                 } else {
@@ -1075,7 +1103,6 @@ final class NostrRelayManager: ObservableObject {
             relays[index].isConnected = isConnected
             relays[index].lastError = error
             if isConnected {
-                relays[index].lastConnectedAt = dependencies.now()
                 relays[index].reconnectAttempts = 0  // Reset on successful connection
                 relays[index].nextReconnectTime = nil
             } else {
@@ -1100,15 +1127,35 @@ final class NostrRelayManager: ObservableObject {
     /// callbacks; treat it as done and let the remaining relays (or the
     /// fallback timeout) drive completion.
     private func settleEOSETrackers(droppingRelay relayUrl: String) {
-        for (id, var tracker) in eoseTrackers where tracker.pendingRelays.contains(relayUrl) {
-            tracker.pendingRelays.remove(relayUrl)
-            if tracker.pendingRelays.isEmpty {
+        for (id, var tracker) in eoseTrackers
+        where tracker.awaitingSend.contains(relayUrl) || tracker.awaitingEOSE.contains(relayUrl) {
+            tracker.awaitingSend.remove(relayUrl)
+            tracker.awaitingEOSE.remove(relayUrl)
+            if tracker.isComplete {
                 eoseTrackers.removeValue(forKey: id)
                 tracker.callback()
             } else {
                 eoseTrackers[id] = tracker
             }
         }
+    }
+
+    /// Whether any of `relayUrls` currently holds a live connection. Lets
+    /// subscribers distinguish "loaded, empty" from "never reached a relay"
+    /// when an EOSE fallback fires.
+    func isAnyRelayConnected(among relayUrls: [String]) -> Bool {
+        let targets = Set(relayUrls)
+        return relays.contains { targets.contains($0.url) && $0.isConnected }
+    }
+
+    /// Marks the REQ as delivered to `relayUrl`: EOSE completion now waits on
+    /// this relay instead of the never-connected remainder.
+    private func markEOSESubscribed(id: String, relayUrl: String) {
+        guard var tracker = eoseTrackers[id],
+              tracker.awaitingSend.remove(relayUrl) != nil else { return }
+        tracker.awaitingEOSE.insert(relayUrl)
+        tracker.didSend = true
+        eoseTrackers[id] = tracker
     }
 
     private func handleDisconnection(relayUrl: String, error: Error) {
@@ -1460,6 +1507,29 @@ struct NostrFilter: Encodable {
         filter.kinds = [1]
         filter.since = since?.timeIntervalSince1970.toInt()
         filter.tagFilters = ["g": geohashes]
+        filter.limit = limit
+        return filter
+    }
+
+    // For the mesh bridge: rendezvous messages (kind 20000) and presence
+    // (kind 20001) tagged `#r` with one or more cells (own + neighbors).
+    static func bridgeRendezvous(_ cells: [String], since: Date? = nil, limit: Int = 200) -> NostrFilter {
+        var filter = NostrFilter()
+        filter.kinds = [20000, 20001]
+        filter.since = since?.timeIntervalSince1970.toInt()
+        filter.tagFilters = ["r": cells]
+        filter.limit = limit
+        return filter
+    }
+
+    // For courier drops: sealed envelopes (kind 1401) parked under rotating
+    // recipient tags (`#x`, hex). Callers pass every candidate tag (adjacent
+    // UTC days x recipients) in one filter.
+    static func courierDrops(recipientTagsHex: [String], since: Date? = nil, limit: Int = 100) -> NostrFilter {
+        var filter = NostrFilter()
+        filter.kinds = [NostrProtocol.EventKind.courierDrop.rawValue]
+        filter.since = since?.timeIntervalSince1970.toInt()
+        filter.tagFilters = ["x": recipientTagsHex]
         filter.limit = limit
         return filter
     }

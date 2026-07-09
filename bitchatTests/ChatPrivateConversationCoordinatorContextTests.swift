@@ -100,11 +100,6 @@ private final class MockChatPrivateConversationContext: ChatPrivateConversationC
         unreadPrivateMessages.remove(peerID)
     }
 
-    func removePrivateChat(_ peerID: PeerID) {
-        privateChats.removeValue(forKey: peerID)
-        unreadPrivateMessages.remove(peerID)
-    }
-
     func migratePrivateChat(from oldPeerID: PeerID, to newPeerID: PeerID) {
         migratedChats.append((oldPeerID, newPeerID))
         guard oldPeerID != newPeerID, let source = privateChats[oldPeerID] else { return }
@@ -177,12 +172,10 @@ private final class MockChatPrivateConversationContext: ChatPrivateConversationC
     // Routing & acknowledgements
     private(set) var routedPrivateMessages: [(content: String, peerID: PeerID, messageID: String)] = []
     private(set) var routedReadReceipts: [(messageID: String, peerID: PeerID)] = []
-    private(set) var routedFavoriteNotifications: [(peerID: PeerID, isFavorite: Bool)] = []
     private(set) var meshReadReceipts: [(messageID: String, peerID: PeerID)] = []
     private(set) var geoPrivateMessages: [(content: String, recipientHex: String, messageID: String)] = []
     private(set) var geoDeliveryAcks: [(messageID: String, recipientHex: String)] = []
     private(set) var geoReadReceipts: [(messageID: String, recipientHex: String)] = []
-    private(set) var embeddedDeliveryAckMessageIDs: [String] = []
 
     func routePrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
         routedPrivateMessages.append((content, peerID, messageID))
@@ -190,10 +183,6 @@ private final class MockChatPrivateConversationContext: ChatPrivateConversationC
 
     func routeReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) {
         routedReadReceipts.append((receipt.originalMessageID, peerID))
-    }
-
-    func routeFavoriteNotification(to peerID: PeerID, isFavorite: Bool) {
-        routedFavoriteNotifications.append((peerID, isFavorite))
     }
 
     func sendMeshReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) {
@@ -210,10 +199,6 @@ private final class MockChatPrivateConversationContext: ChatPrivateConversationC
 
     func sendGeohashReadReceipt(_ messageID: String, toRecipientHex recipientHex: String, from identity: NostrIdentity) {
         geoReadReceipts.append((messageID, recipientHex))
-    }
-
-    func sendDeliveryAckViaNostrEmbedded(_ message: BitchatMessage, wasReadBefore: Bool, senderPubkey: String, key: Data?) {
-        embeddedDeliveryAckMessageIDs.append(message.id)
     }
 
     // Favorites & notifications
@@ -247,6 +232,12 @@ private final class MockChatPrivateConversationContext: ChatPrivateConversationC
 
     func addMeshOnlySystemMessage(_ content: String) {
         meshOnlySystemMessages.append(content)
+    }
+
+    private(set) var privateSystemMessages: [(content: String, peerID: PeerID)] = []
+
+    func addLocalPrivateSystemMessage(_ content: String, to peerID: PeerID) {
+        privateSystemMessages.append((content, peerID))
     }
 
     static let dummyIdentity = NostrIdentity(
@@ -695,19 +686,21 @@ struct ChatPrivateConversationCoordinatorContextTests {
         #expect(context.systemMessages.isEmpty)
     }
 
+    /// Field-found: pre-judging reachability here marked the message failed
+    /// without ever routing it, so the router's retained outbox, courier
+    /// deposits, and bridge drops never got a chance. A fully unreachable
+    /// non-favorite must still be routed and stay "sending" (the router's
+    /// callbacks later move it to carried/delivered or expire it as failed).
     @Test @MainActor
-    func sendPrivateMessage_failsWhenOfflineWithoutMutualFavorite() async {
+    func sendPrivateMessage_routesAndStaysSendingWhenOfflineWithoutMutualFavorite() async {
         let context = MockChatPrivateConversationContext()
         let coordinator = ChatPrivateConversationCoordinator(context: context)
         let peerID = PeerID(hexData: Data(repeating: 0xCD, count: 32))
 
         coordinator.sendPrivateMessage("hello?", to: peerID)
 
-        #expect(context.routedPrivateMessages.isEmpty)
-        #expect(context.systemMessages.count == 1)
-        guard case .failed = context.privateChats[peerID]?.first?.deliveryStatus else {
-            Issue.record("expected .failed delivery status")
-            return
-        }
+        #expect(context.routedPrivateMessages.map(\.content) == ["hello?"])
+        #expect(context.privateChats[peerID]?.first?.deliveryStatus == .sending)
+        #expect(context.systemMessages.isEmpty)
     }
 }

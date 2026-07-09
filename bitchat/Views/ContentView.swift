@@ -35,6 +35,7 @@ struct ContentView: View {
     @EnvironmentObject private var privateConversationModel: PrivateConversationModel
     @EnvironmentObject private var verificationModel: VerificationModel
     @EnvironmentObject private var conversationUIModel: ConversationUIModel
+    @EnvironmentObject private var locationChannelsModel: LocationChannelsModel
 
     @StateObject private var voiceRecordingVM = VoiceRecordingViewModel()
     @State private var messageText = ""
@@ -75,6 +76,9 @@ struct ContentView: View {
             .onAppear {
                 conversationUIModel.setCurrentColorScheme(colorScheme)
                 conversationUIModel.setCurrentTheme(appTheme)
+                voiceRecordingVM.sessionProvider = { [weak conversationUIModel] in
+                    conversationUIModel?.makeVoiceCaptureSession() ?? VoiceNoteCaptureSession()
+                }
                 #if os(macOS)
                 DispatchQueue.main.async {
                     isNicknameFieldFocused = false
@@ -147,7 +151,11 @@ struct ContentView: View {
             #endif
         }
         .sheet(isPresented: $appChromeModel.isAppInfoPresented) {
-            AppInfoView(topologyProvider: { appChromeModel.meshTopologyDisplayModel() })
+            AppInfoView(
+                topologyProvider: { appChromeModel.meshTopologyDisplayModel() },
+                onPanicWipe: { appChromeModel.panicClearAllData() }
+            )
+            .environmentObject(locationChannelsModel)
         }
         .sheet(isPresented: Binding(
             get: { appChromeModel.showingFingerprintFor != nil && !showSidebar && selectedPrivatePeerID == nil },

@@ -42,6 +42,9 @@ protocol ChatOutgoingContext: AnyObject {
     func recordPublicActivity(forChannelKey key: String)
     func sendMeshMessage(_ content: String, mentions: [String], messageID: String, timestamp: Date)
     func sendGeohash(context: ChatViewModel.GeoOutgoingContext)
+    /// Ships the bridged (rendezvous) copy of a just-sent public mesh
+    /// message; no-op when the bridge is off or the send is nearby-only.
+    func bridgeOutgoingPublicMessage(_ content: String, messageID: String)
 
     // MARK: Geohash identity (shared with the other contexts)
     func deriveNostrIdentity(forGeohash geohash: String) throws -> NostrIdentity
@@ -61,6 +64,10 @@ extension ChatViewModel: ChatOutgoingContext {
 
     func recordPublicActivity(forChannelKey key: String) {
         lastPublicActivityAt[key] = Date()
+    }
+
+    func bridgeOutgoingPublicMessage(_ content: String, messageID: String) {
+        BridgeService.shared.bridgeOutgoing(content: content, messageID: messageID)
     }
 }
 
@@ -112,6 +119,13 @@ final class ChatOutgoingCoordinator {
             sendGeohashPublicMessage(trimmed, mentions: mentions, channel: channel)
         }
     }
+
+    /// Broadcasts a wave on the mesh channel regardless of the active channel —
+    /// used by the "bitchatters nearby" notification quick action, which always
+    /// refers to mesh peers.
+    func sendMeshWave() {
+        sendMeshPublicMessage(originalContent: "👋", trimmed: "👋", mentions: [])
+    }
 }
 
 private extension ChatOutgoingCoordinator {
@@ -133,6 +147,7 @@ private extension ChatOutgoingCoordinator {
             messageID: message.id,
             timestamp: message.timestamp
         )
+        context.bridgeOutgoingPublicMessage(trimmed, messageID: message.id)
     }
 
     /// Geohash sends mine a NIP-13 nonce tag first (off the main actor, see
