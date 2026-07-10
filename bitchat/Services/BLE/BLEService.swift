@@ -41,6 +41,10 @@ final class BLEService: NSObject {
     // store): entries older than the cooldown are pruned on insert.
     private var lastLinkRebindAt: [String: Date] = [:]
 
+    // Redundant-link retirement cooldown per peer (bleQueue-owned): bounds
+    // how often a replayed announce could flip which duplicate link survives.
+    private var lastRedundantLinkRetirementAt: [PeerID: Date] = [:]
+
     // BCH-01-004: Rate-limiting for subscription-triggered announces.
     private var subscriptionAnnounceLimiter = BLESubscriptionAnnounceLimiter()
     
@@ -129,6 +133,15 @@ final class BLEService: NSObject {
     // Application state tracking (thread-safe)
     #if os(iOS)
     private var isAppActive: Bool = true  // Assume active initially
+    /// Last `UIApplication.shared.backgroundTimeRemaining` sampled on the
+    /// main thread, cached so bleQueue status logs can read it without ever
+    /// dispatching to main (see `captureBluetoothStatus` for the invariant).
+    private let backgroundTimeLock = NSLock()
+    private var _cachedBackgroundTimeRemaining: TimeInterval = .greatestFiniteMagnitude
+    private var cachedBackgroundTimeRemaining: TimeInterval {
+        backgroundTimeLock.lock(); defer { backgroundTimeLock.unlock() }
+        return _cachedBackgroundTimeRemaining
+    }
     #endif
     
     // MARK: - Core BLE Objects
@@ -176,6 +189,13 @@ final class BLEService: NSObject {
 
     // Ingress link tracking for duplicate and last-hop suppression
     private var ingressLinks = BLEIngressLinkRegistry()
+    // Inner message IDs of recently opened courier envelopes. Redundant
+    // copies of one message ride different envelopes (each seal uses a fresh
+    // ephemeral key, and bridge drops multiply across relays/couriers), so
+    // envelope-level dedup can't catch them; dedup on the inner ID before
+    // delivery so a duplicate costs one decrypt instead of a delivery + ack
+    // + handshake each. Owned by collectionsQueue barriers.
+    private var openedCourierMessageIDs = BoundedIDSet(capacity: TransportConfig.courierOpenedMessageIDCap)
     private let logRateLimiter = BLELogRateLimiter(defaultMinimumInterval: 5)
 
     private var pendingPeripheralWrites = BLEOutboundWriteBuffer()
@@ -265,12 +285,18 @@ final class BLEService: NSObject {
         
         // Set up application state tracking (iOS only)
         #if os(iOS)
-        // Check initial state on main thread
+        // Check initial state on main thread. The background-budget cache is
+        // seeded here too: a background-restore launch captures Bluetooth
+        // status before any lifecycle notification fires, and the init-time
+        // sentinel would log a meaningless bgRemaining=∞ for exactly the
+        // wake window that matters.
         if Thread.isMainThread {
             isAppActive = UIApplication.shared.applicationState == .active
+            refreshCachedBackgroundTimeRemaining()
         } else {
             DispatchQueue.main.sync {
                 isAppActive = UIApplication.shared.applicationState == .active
+                refreshCachedBackgroundTimeRemaining()
             }
         }
         
@@ -674,6 +700,19 @@ final class BLEService: NSObject {
         }
     }
 
+    func canDeliverSecurely(to peerID: PeerID) -> Bool {
+        // A live link binding alone is forgeable: the rotation heal rebinds a
+        // link on a signature-verified "direct" announce, but directness rides
+        // on the unsigned TTL, so a replayed announce can bind an absent
+        // peer's ID to the replayer's link. An established Noise session
+        // proves the other end of the link holds the peer's private key.
+        //
+        // Sessions are keyed by the short wire ID, so normalize like
+        // isPeerConnected does — a send keyed by the full 64-hex Noise key
+        // must not misread an established session as insecure.
+        noiseService.hasEstablishedSession(with: peerID.toShort())
+    }
+
     func peerNickname(peerID: PeerID) -> String? {
         collectionsQueue.sync {
             peerRegistry.nickname(for: peerID, connectedOnly: true)
@@ -764,7 +803,11 @@ final class BLEService: NSObject {
     }
     
     func triggerHandshake(with peerID: PeerID) {
-        initiateNoiseHandshake(with: peerID)
+        // Callers are on the main actor; the handshake broadcast sync-waits
+        // on bleQueue for link state, so hop off main first.
+        messageQueue.async { [weak self] in
+            self?.initiateNoiseHandshake(with: peerID)
+        }
     }
     
     // MARK: Noise identity/session access (narrow Transport wrappers)
@@ -919,6 +962,15 @@ final class BLEService: NSObject {
 
     
     func sendReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) {
+        // Hop like sendMessage: callers are often on the main actor, and the
+        // send path sync-waits on bleQueue for link state — the main thread
+        // must never block on bleQueue (see captureBluetoothStatus).
+        if DispatchQueue.getSpecific(key: messageQueueKey) == nil {
+            messageQueue.async { [weak self] in
+                self?.sendReadReceipt(receipt, to: peerID)
+            }
+            return
+        }
         let payload = BLENoisePayloadFactory.readReceipt(originalMessageID: receipt.originalMessageID)
 
         if noiseService.hasEstablishedSession(with: peerID) {
@@ -929,11 +981,15 @@ final class BLEService: NSObject {
                 SecureLogger.error("Failed to send read receipt: \(error)")
             }
         } else {
-            // Queue for after handshake and initiate if needed
+            // Queue for after handshake; initiate only while the peer is
+            // around to answer (see sendDeliveryAck — absent senders must
+            // not turn queued acks into handshake floods).
             collectionsQueue.sync(flags: .barrier) {
                 pendingNoiseSessionQueues.appendTypedPayload(payload, for: peerID)
             }
-            if !noiseService.hasSession(with: peerID) { initiateNoiseHandshake(with: peerID) }
+            if !noiseService.hasSession(with: peerID), isPeerReachable(peerID) {
+                initiateNoiseHandshake(with: peerID)
+            }
             SecureLogger.debug("🕒 Queued READ receipt for \(peerID.id.prefix(8))… until handshake completes", category: .session)
         }
     }
@@ -1138,8 +1194,13 @@ final class BLEService: NSObject {
         let outboundPriority = BLEOutboundPacketPolicy.priority(for: packet, data: data)
 
         let states = snapshotPeripheralStates()
-        let connectedStates = states.filter { $0.isConnected }
-        let subscribedCentrals = characteristic == nil ? [] : snapshotSubscribedCentrals().centrals
+        // A link without a discovered characteristic cannot be written to
+        // (the write loop below skips it); offering it to the planner only
+        // wastes fanout slots — and a peer's single collapsed copy would be
+        // silently dropped if its bound link is still mid-rediscovery.
+        let connectedStates = states.filter { $0.isConnected && $0.characteristic != nil }
+        let centralSnapshot = snapshotSubscribedCentrals()
+        let subscribedCentrals = characteristic == nil ? [] : centralSnapshot.centrals
         let connectedPeripheralIDs = connectedStates.map { $0.peripheral.identifier.uuidString }
         let centralIDs = subscribedCentrals.map { $0.identifier.uuidString }
         let peripheralPeerBindings = Dictionary(uniqueKeysWithValues: connectedStates.compactMap { state in
@@ -1155,7 +1216,12 @@ final class BLEService: NSObject {
             ingressRecord: ingressRecord,
             excludedLinks: excludedPeerLinks,
             peripheralPeerBindings: peripheralPeerBindings,
-            centralPeerBindings: snapshotSubscribedCentrals().peerIDsByCentralUUID,
+            centralPeerBindings: centralSnapshot.peerIDsByCentralUUID,
+            // Perf note: this is a third bleQueue hop per send; if send-path
+            // profiling ever flags it, fold it into snapshotPeripheralStates
+            // as a combined snapshot.
+            preferredPeripheralPerPeer: readLinkState { $0.preferredPeripheralBindings },
+            directAnnounceTTL: messageTTL,
             directedOnlyPeer: directedOnlyPeer
         )
 
@@ -1256,6 +1322,10 @@ final class BLEService: NSObject {
     }
 
     // MARK: - Archived public messages ("heard here earlier")
+
+    func purgeArchivedPublicMessages(from peerID: PeerID) {
+        gossipSyncManager?.removePublicMessages(from: peerID)
+    }
 
     func collectArchivedPublicMessages(completion: @escaping @MainActor ([ArchivedPublicMessage]) -> Void) {
         guard let sync = gossipSyncManager else {
@@ -1378,6 +1448,15 @@ final class BLEService: NSObject {
     }
     
     func sendDeliveryAck(for messageID: String, to peerID: PeerID) {
+        // Hop like sendMessage: callers are often on the main actor, and the
+        // send path sync-waits on bleQueue for link state — the main thread
+        // must never block on bleQueue (see captureBluetoothStatus).
+        if DispatchQueue.getSpecific(key: messageQueueKey) == nil {
+            messageQueue.async { [weak self] in
+                self?.sendDeliveryAck(for: messageID, to: peerID)
+            }
+            return
+        }
         let payload = BLENoisePayloadFactory.delivered(messageID: messageID)
 
         if noiseService.hasEstablishedSession(with: peerID) {
@@ -1387,11 +1466,18 @@ final class BLEService: NSObject {
                 SecureLogger.error("Failed to send delivery ACK: \(error)")
             }
         } else {
-            // Queue for after handshake and initiate if needed
+            // Queue for after handshake; initiate only while the peer is
+            // around to answer — couriered/bridged mail routinely arrives
+            // from absent (or rotated) identities, and every duplicate copy
+            // initiating a handshake broadcast turns one undeliverable ack
+            // into a mesh-wide flood. The queued ack flushes whenever a
+            // session eventually establishes.
             collectionsQueue.sync(flags: .barrier) {
                 pendingNoiseSessionQueues.appendTypedPayload(payload, for: peerID)
             }
-            if !noiseService.hasSession(with: peerID) { initiateNoiseHandshake(with: peerID) }
+            if !noiseService.hasSession(with: peerID), isPeerReachable(peerID) {
+                initiateNoiseHandshake(with: peerID)
+            }
             SecureLogger.debug("🕒 Queued DELIVERED ack for \(peerID.id.prefix(8))… until handshake completes", category: .session)
         }
     }
@@ -1663,7 +1749,10 @@ extension BLEService: CBCentralManagerDelegate {
             recentPeripheralCache.record(peripheral, peripheralID: identifier, at: Date())
         }
 
-        captureBluetoothStatus(context: "central-restore")
+        // Via the sampler (not a direct capture): it refreshes the cached
+        // background budget on main first, so the restore log shows the real
+        // wake window instead of the init sentinel.
+        logBluetoothStatus("central-restore")
 
         if central.state == .poweredOn {
             startScanning()
@@ -1850,7 +1939,17 @@ extension BLEService: CBCentralManagerDelegate {
 
         // Clean up references and peer mappings
         _ = linkStateStore.removePeripheral(peripheralID)
-        if let peerID {
+        // A duplicate link can drop while the peer stays live on another
+        // (the dual-role central link, or a second bound link after a
+        // restore): peer-disconnect bookkeeping only runs once the peer's
+        // last live link is gone. removePeripheral just repaired the reverse
+        // map onto a connected survivor, so directLinkState is accurate
+        // here. The scan restart and connect-slot refill below stay
+        // unguarded — they respond to the physical drop regardless of
+        // remaining logical links.
+        let remainingLinks = peerID.map { linkStateStore.directLinkState(for: $0) }
+        let peerStillLinked = (remainingLinks?.hasPeripheral ?? false) || (remainingLinks?.hasCentral ?? false)
+        if let peerID, !peerStillLinked {
             // Do not remove peer; mark as not connected but retain for reachability
             collectionsQueue.sync(flags: .barrier) {
                 peerRegistry.markDisconnected(peerID)
@@ -1858,7 +1957,7 @@ extension BLEService: CBCentralManagerDelegate {
             refreshLocalTopology()
         }
 
-        
+
         // Restart scanning with allow duplicates for faster rediscovery
         if centralManager?.state == .poweredOn {
             // Stop and restart scanning to ensure we get fresh discovery events
@@ -1869,15 +1968,15 @@ extension BLEService: CBCentralManagerDelegate {
         }
         // Attempt to fill freed slot from queue
         bleQueue.async { [weak self] in self?.tryConnectFromQueue() }
-        
+
         // Notify delegate about disconnection on main thread (direct link dropped)
         notifyUI { [weak self] in
             guard let self = self else { return }
-            
+
             // Get current peer list (after removal)
             let currentPeerIDs = self.collectionsQueue.sync { self.peerRegistry.peerIDs }
-            
-            if let peerID {
+
+            if let peerID, !peerStillLinked {
                 self.notifyPeerDisconnectedDebounced(peerID)
             }
             self.requestPeerDataPublish()
@@ -2077,6 +2176,16 @@ extension BLEService {
                 lastSeen: Date()
             ))
         }
+    }
+
+    /// Handshake plumbing for tests that need a real established Noise
+    /// session (e.g. canDeliverSecurely) without Bluetooth in the loop.
+    func _test_noiseInitiateHandshake(with peerID: PeerID) throws -> Data {
+        try noiseService.initiateHandshake(with: peerID)
+    }
+
+    func _test_noiseProcessHandshakeMessage(from peerID: PeerID, message: Data) throws -> Data? {
+        try noiseService.processHandshakeMessage(from: peerID, message: message)
     }
 
     static func _test_shouldRediscoverBitChatService(
@@ -2412,7 +2521,8 @@ extension BLEService: CBPeripheralManagerDelegate {
             }
         }
 
-        captureBluetoothStatus(context: "peripheral-restore")
+        // Via the sampler for a fresh background budget (see central-restore).
+        logBluetoothStatus("peripheral-restore")
 
         if peripheral.state == .poweredOn && !peripheral.isAdvertising {
             peripheral.startAdvertising(buildAdvertisementData())
@@ -2479,6 +2589,13 @@ extension BLEService: CBPeripheralManagerDelegate {
         
         // Find and disconnect the peer associated with this central
         if let peerID = removedPeerID {
+            // The remote side retiring a redundant duplicate connection
+            // arrives here as an unsubscribe while the peer stays live on
+            // its other links; only the peer's last link disconnecting
+            // counts. If every link truly dropped, the surviving-link
+            // callbacks (didDisconnectPeripheral, or this one again) run
+            // the bookkeeping.
+            guard linkStateStore.links(to: peerID).isEmpty else { return }
             // Mark peer as not connected; retain for reachability
             collectionsQueue.sync(flags: .barrier) {
                 peerRegistry.markDisconnected(peerID)
@@ -2693,18 +2810,36 @@ extension BLEService {
     }
 
     private func logBluetoothStatus(_ context: String) {
-        bleQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.captureBluetoothStatus(context: context)
-        }
+        scheduleBluetoothStatusSample(after: 0, context: context)
     }
 
     private func scheduleBluetoothStatusSample(after delay: TimeInterval, context: String) {
-        bleQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self = self else { return }
-            self.captureBluetoothStatus(context: context)
+        #if os(iOS)
+        // Sample the main-actor background budget first (async hop, never a
+        // sync wait), then log from bleQueue off the cache — bleQueue must
+        // never block on main (see captureBluetoothStatus).
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.refreshCachedBackgroundTimeRemaining()
+            self.bleQueue.async { self.captureBluetoothStatus(context: context) }
         }
+        #else
+        bleQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.captureBluetoothStatus(context: context)
+        }
+        #endif
     }
+
+    #if os(iOS)
+    /// Main thread only (reads main-actor UIApplication state).
+    private func refreshCachedBackgroundTimeRemaining() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let seconds = UIApplication.shared.backgroundTimeRemaining
+        backgroundTimeLock.lock()
+        _cachedBackgroundTimeRemaining = seconds
+        backgroundTimeLock.unlock()
+    }
+    #endif
 
     private func captureBluetoothStatus(context: String) {
         assert(DispatchQueue.getSpecific(key: bleQueueKey) != nil, "captureBluetoothStatus must run on bleQueue")
@@ -2723,11 +2858,15 @@ extension BLEService {
         }
 
         #if os(iOS)
-        var backgroundDescriptor = ""
-        var backgroundSeconds: TimeInterval = 0
-        DispatchQueue.main.sync {
-            backgroundSeconds = UIApplication.shared.backgroundTimeRemaining
-        }
+        // INVARIANT: bleQueue must NEVER sync-dispatch to the main thread.
+        // The main actor sync-waits on bleQueue along the send paths
+        // (readLinkState), so a main.sync here completes an ABBA deadlock —
+        // field-verified as a permanent freeze when a courier-drop storm put
+        // an ack send (main → bleQueue.sync) up against a status capture
+        // (bleQueue → main.sync). backgroundTimeRemaining is main-actor
+        // state, so it is sampled on main and cached.
+        let backgroundSeconds = cachedBackgroundTimeRemaining
+        let backgroundDescriptor: String
         if backgroundSeconds == .greatestFiniteMagnitude {
             backgroundDescriptor = " bgRemaining=∞"
         } else {
@@ -3017,6 +3156,15 @@ extension BLEService {
 
     
     private func sendNoisePayload(_ typedPayload: Data, to peerID: PeerID) {
+        // Hop like sendMessage: the Transport-facing wrappers (verify/vouch/
+        // group payloads) call this from the main actor, and the send path
+        // sync-waits on bleQueue for link state.
+        if DispatchQueue.getSpecific(key: messageQueueKey) == nil {
+            messageQueue.async { [weak self] in
+                self?.sendNoisePayload(typedPayload, to: peerID)
+            }
+            return
+        }
         guard noiseService.hasSession(with: peerID) else {
             // No session yet - queue the payload SYNCHRONOUSLY before initiating handshake
             // to prevent race where fast handshake completion drains empty queue
@@ -3264,6 +3412,23 @@ extension BLEService {
                 SecureLogger.warning("⚠️ Courier envelope carried unsupported payload type", category: .session)
                 return
             }
+            let payload = Data(typedPayload.dropFirst())
+            guard let innerMessageID = PrivateMessagePacket.decode(from: payload)?.messageID else {
+                SecureLogger.warning("⚠️ Courier envelope carried undecodable private message", category: .session)
+                return
+            }
+            // Redundant copies of one message arrive as distinct envelopes
+            // (fresh seal each: mesh couriers, bridge drops across relays),
+            // so dedup here on the inner message ID — before delivery, ack,
+            // and handshake work. A duplicate costs only the decrypt above
+            // and at most one ack ever goes out per message ID.
+            let firstOpen = collectionsQueue.sync(flags: .barrier) {
+                openedCourierMessageIDs.insert(innerMessageID)
+            }
+            guard firstOpen else {
+                SecureLogger.debug("📦 Dropping duplicate courier envelope for message \(innerMessageID.prefix(8))…", category: .session)
+                return
+            }
             // Couriered mail arrives while the sender is absent, so the UI's
             // block check can't resolve their fingerprint from a live session.
             // Gate here, where the full static key is in hand.
@@ -3279,7 +3444,6 @@ extension BLEService {
             let shortID = PeerID(publicKey: senderStaticKey)
             let isKnownOnMesh = collectionsQueue.sync { peerRegistry.info(for: shortID) != nil }
             let senderPeerID = isKnownOnMesh ? shortID : PeerID(hexData: senderStaticKey)
-            let payload = Data(typedPayload.dropFirst())
             SecureLogger.debug("📦 Opened courier envelope from \(senderPeerID.id.prefix(8))…", category: .session)
             sfMetrics?.record(.courierOpened)
             notifyUI { [weak self] in
@@ -3718,6 +3882,7 @@ extension BLEService {
     #if os(iOS)
     @objc private func appDidBecomeActive() {
         isAppActive = true
+        refreshCachedBackgroundTimeRemaining()
         // Restart scanning with allow duplicates when app becomes active
         if centralManager?.state == .poweredOn {
             centralManager?.stopScan()
@@ -3731,6 +3896,7 @@ extension BLEService {
 
     @objc private func appDidEnterBackground() {
         isAppActive = false
+        refreshCachedBackgroundTimeRemaining()
         // Restart scanning without allow duplicates in background
         if centralManager?.state == .poweredOn {
             centralManager?.stopScan()
@@ -3824,6 +3990,15 @@ extension BLEService {
     // MARK: Private Message Handling
     
     private func sendPrivateMessage(_ content: String, to recipientID: PeerID, messageID: String) {
+        // Hop like sendMessage: the Transport-facing wrappers call this from
+        // the main actor (router sends, favorite notifications), and the send
+        // path sync-waits on bleQueue for link state.
+        if DispatchQueue.getSpecific(key: messageQueueKey) == nil {
+            messageQueue.async { [weak self] in
+                self?.sendPrivateMessage(content, to: recipientID, messageID: messageID)
+            }
+            return
+        }
         // Sessions and wire recipient IDs are keyed by the short 16-hex form;
         // callers may pass the full 64-hex noise key (mirrors sendFilePrivate).
         let recipientID = recipientID.toShort()
@@ -3970,6 +4145,12 @@ extension BLEService {
             } else {
                 SecureLogger.debug("🚦 Queued fragment transfer waiting for slot", category: .session)
             }
+
+        case let .droppedDuplicate(_, activeTransferId):
+            SecureLogger.debug(
+                "🔁 Skipping duplicate outbound transfer — same content already in flight as \(activeTransferId?.prefix(8) ?? "?")…",
+                category: .session
+            )
         }
     }
 
@@ -4302,9 +4483,11 @@ extension BLEService {
         }
 
         // A verified direct announce proves the sender owns the link it came
-        // in on: heal any stale binding left by a peer-ID rotation.
+        // in on: heal any stale binding left by a peer-ID rotation, and
+        // consolidate duplicate same-role connections onto that link.
         if let result, result.isVerified, result.isDirectAnnounce {
             rebindLinkAfterVerifiedDirectAnnounce(packet, to: result.peerID)
+            retireRedundantPeripheralLinks(packet, to: result.peerID)
         }
 
         // Bridge courier watch: a verified announce may add a peer whose
@@ -4384,12 +4567,129 @@ extension BLEService {
             }
             SecureLogger.debug("🔄 Rebinding link after peer-ID rotation: \(previousPeerID.id.prefix(8))… → \(peerID.id.prefix(8))…", category: .session)
             self.refreshLocalTopology()
+            // The announce that triggered this rebind was upserted as
+            // disconnected: the registry ran while the link still belonged
+            // to the previous ID (the ambiguous state BLEAnnounceHandler
+            // denies the connected shortcut). The rebind has now
+            // containment-checked the claim and the identity owns a live
+            // link, so promote it — otherwise a healed rotation leaves a
+            // live link that reads as disconnected until the next announce.
+            self.messageQueue.async { [weak self] in
+                self?.promoteReboundPeerToConnected(peerID)
+            }
+            // Any other peripheral links still bound to the rotated-away ID
+            // are stale duplicates of the same physical device (its restored
+            // connections outlived the relaunch that rotated the ID): cancel
+            // them now instead of leaving ghost links that spray duplicate
+            // traffic until the inactivity timeout.
+            self.cancelBoundPeripheralLinks(to: previousPeerID, keeping: linkUUID)
             // Retire the rotated-away ID only once its last link is gone; a
             // remaining stale link heals the same way or ages out.
             guard self.linkStateStore.links(to: previousPeerID).isEmpty else { return }
             self.messageQueue.async { [weak self] in
                 self?.retireRotatedPeer(previousPeerID)
             }
+        }
+    }
+
+    /// After a restore relaunch the same phone can reappear under a fresh
+    /// peripheral UUID while its restored connection lives on, leaving
+    /// several live central-role connections to one peer that each carry
+    /// every packet (field-verified: every voice frame arrived 2-3x). A
+    /// verified direct announce is the consolidation point: keep the link it
+    /// proves live (or the peer's most recently bound one) and cancel the
+    /// rest. Only same-role duplicates are touched — one connection per role
+    /// is the normal dual-role topology — and only connections we own as
+    /// central: the peer's central subscriptions on our peripheral manager
+    /// are its connections to cancel, and it runs this same policy.
+    ///
+    /// Directness is forgeable (TTL is unsigned), so a replayed announce
+    /// could nominate the replayer's link as the survivor. Containment
+    /// mirrors the rotation rebind: only links already BOUND to the peer are
+    /// retired (announce-evidenced, never pre-announce links), at most one
+    /// retirement per peer per cooldown window, and the peer keeps a live
+    /// link either way.
+    private func retireRedundantPeripheralLinks(_ packet: BitchatPacket, to peerID: PeerID) {
+        let ingressLink = collectionsQueue.sync { ingressLinks.link(for: packet) }
+        bleQueue.async { [weak self] in
+            guard let self else { return }
+            let now = Date()
+            self.lastRedundantLinkRetirementAt = self.lastRedundantLinkRetirementAt.filter {
+                now.timeIntervalSince($0.value) < TransportConfig.bleLinkRebindCooldownSeconds
+            }
+            guard self.lastRedundantLinkRetirementAt[peerID] == nil else { return }
+
+            var ingressPeripheralUUID: String?
+            if case .peripheral(let uuid) = ingressLink {
+                ingressPeripheralUUID = uuid
+            }
+            guard let keptUUID = BLERedundantLinkPolicy.keptPeripheralUUID(
+                ingressPeripheralUUID: ingressPeripheralUUID,
+                mostRecentlyBoundUUID: self.linkStateStore.preferredPeripheralBindings[peerID],
+                links: self.peripheralLinkPolicySnapshot(),
+                peerID: peerID
+            ) else { return }
+
+            self.lastRedundantLinkRetirementAt[peerID] = now
+            // The survivor becomes the peer's reverse-mapped link so directed
+            // sends follow the consolidation.
+            self.linkStateStore.bindPeripheral(keptUUID, to: peerID)
+            self.cancelBoundPeripheralLinks(to: peerID, keeping: keptUUID)
+            self.refreshLocalTopology()
+        }
+    }
+
+    /// Cancels our central-role connections whose link is bound to `peerID`,
+    /// except `keptUUID`. bleQueue only. Each entry is removed from the link
+    /// store BEFORE cancelling so didDisconnectPeripheral sees no peer
+    /// binding and skips its peer-disconnect bookkeeping — the peer is still
+    /// live (on the kept link, or under its rotated identity).
+    private func cancelBoundPeripheralLinks(to peerID: PeerID, keeping keptUUID: String?) {
+        let retiring = BLERedundantLinkPolicy.peripheralUUIDsToRetire(
+            links: peripheralLinkPolicySnapshot(),
+            peerID: peerID,
+            keeping: keptUUID ?? ""
+        )
+        for uuid in retiring {
+            guard let state = linkStateStore.state(forPeripheralID: uuid) else { continue }
+            _ = linkStateStore.removePeripheral(uuid)
+            SecureLogger.info(
+                "🔗 Retiring redundant link \(uuid.prefix(8))… bound to \(peerID.id.prefix(8))…\(keptUUID.map { " (keeping \($0.prefix(8))…)" } ?? "")",
+                category: .session
+            )
+            centralManager?.cancelPeripheralConnection(state.peripheral)
+        }
+    }
+
+    /// bleQueue only (reads the link store).
+    private func peripheralLinkPolicySnapshot() -> [BLERedundantLinkPolicy.PeripheralLink] {
+        linkStateStore.peripheralStates.map {
+            BLERedundantLinkPolicy.PeripheralLink(
+                uuid: $0.peripheral.identifier.uuidString,
+                peerID: $0.peerID,
+                isConnected: $0.isConnected,
+                hasCharacteristic: $0.characteristic != nil
+            )
+        }
+    }
+
+    /// After a successful verified rebind the new identity owns a live link,
+    /// but its announce was stored disconnected (the link was still bound to
+    /// the rotated-away ID when the registry upsert ran). Flip it to
+    /// connected and republish so routing and the peer list see the healed
+    /// link. The `.peerConnected` UI event already fired from the announce
+    /// path (new/reconnected + direct), so only list state needs refreshing.
+    private func promoteReboundPeerToConnected(_ peerID: PeerID) {
+        let promoted = collectionsQueue.sync(flags: .barrier) {
+            peerRegistry.markConnected(peerID)
+        }
+        guard promoted else { return }
+        refreshLocalTopology()
+        publishFullPeerData()
+        notifyUI { [weak self] in
+            guard let self else { return }
+            let currentPeerIDs = self.collectionsQueue.sync { self.peerRegistry.peerIDs }
+            self.deliverTransportEvent(.peerListUpdated(currentPeerIDs))
         }
     }
 
@@ -4429,6 +4729,25 @@ extension BLEService {
             },
             linkState: { [weak self] peerID in
                 self?.linkState(for: peerID) ?? (hasPeripheral: false, hasCentral: false)
+            },
+            linkBoundToOtherPeer: { [weak self] packet, peerID in
+                // Reads the CURRENT binding — i.e. the state before
+                // rebindLinkAfterVerifiedDirectAnnounce (which runs after the
+                // handler) may steal the link and promote the new owner to
+                // connected. See the caller in BLEAnnounceHandler for why the
+                // residual forged-presence window this leaves is accepted.
+                guard let self else { return false }
+                guard let link = (self.collectionsQueue.sync { self.ingressLinks.link(for: packet) }) else { return false }
+                let boundPeerID: PeerID? = self.readLinkState { store in
+                    switch link {
+                    case .peripheral(let peripheralUUID):
+                        return store.peerID(forPeripheralID: peripheralUUID)
+                    case .central(let centralUUID):
+                        return store.peerID(forCentralUUID: centralUUID)
+                    }
+                }
+                guard let boundPeerID else { return false }
+                return boundPeerID != peerID
             },
             withRegistryBarrier: { [weak self] body in
                 self?.collectionsQueue.sync(flags: .barrier) { body() }
