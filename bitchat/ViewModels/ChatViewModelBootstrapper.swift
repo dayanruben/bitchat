@@ -29,7 +29,9 @@ struct ChatViewModelServiceBundle {
             identityManager: identityManager
         )
         let nostrTransport = NostrTransport(keychain: keychain, idBridge: idBridge)
-        nostrTransport.senderPeerID = meshService.myPeerID
+        nostrTransport.senderPeerIDProvider = { [weak meshService] in
+            meshService?.myPeerID ?? PeerID(str: "")
+        }
         let messageRouter = MessageRouter(
             transports: [meshService, nostrTransport],
             outboxStore: outboxStore,
@@ -442,7 +444,7 @@ private extension ChatViewModelBootstrapper {
                 id: Self.bridgeSubscriptionID,
                 relayUrls: relays.isEmpty ? nil : relays,
                 handler: { event in
-                    BridgeService.shared.handleRendezvousEvent(event)
+                    BridgeService.shared.handleRendezvousEvent(event, signatureAlreadyVerified: true)
                 }
             )
         }

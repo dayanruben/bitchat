@@ -78,7 +78,68 @@ enum CashuTokenDecoder {
     /// fallback: the token must cleanly decode to a known version *and* carry
     /// a positive amount, otherwise this returns nil. This stops base64 junk
     /// and truncated V4 tokens from being relayed as if they were valid money.
+    private final class DecodeCacheEntry: NSObject {
+        let info: TokenInfo?
+        init(_ info: TokenInfo?) { self.info = info }
+    }
+
+    private final class PermissiveDecodeCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var generation: UInt64 = 0
+        private let cache: NSCache<NSString, DecodeCacheEntry> = {
+            let c = NSCache<NSString, DecodeCacheEntry>()
+            c.countLimit = 256
+            return c
+        }()
+
+        func currentGeneration() -> UInt64 {
+            lock.lock()
+            defer { lock.unlock() }
+            return generation
+        }
+
+        func entry(for key: String) -> DecodeCacheEntry? {
+            lock.lock()
+            defer { lock.unlock() }
+            return cache.object(forKey: key as NSString)
+        }
+
+        func store(_ info: TokenInfo?, for key: String, expectedGeneration: UInt64) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard generation == expectedGeneration else { return }
+            cache.setObject(DecodeCacheEntry(info), forKey: key as NSString)
+        }
+
+        func reset() {
+            lock.lock()
+            defer { lock.unlock() }
+            generation &+= 1
+            cache.removeAllObjects()
+        }
+    }
+
+    private static let permissiveCache = PermissiveDecodeCache()
+
+    /// Panic-wipe hook: evicts cached bearer ecash token strings and decoded
+    /// mint/memo metadata from process memory, and fences any in-flight decode.
+    static func resetForPanic() {
+        permissiveCache.reset()
+    }
+
     static func decode(_ raw: String, strict: Bool = false) -> TokenInfo? {
+        let generation = strict ? 0 : permissiveCache.currentGeneration()
+        if !strict, let cached = permissiveCache.entry(for: raw) {
+            return cached.info
+        }
+        let decoded = decodeUncached(raw, strict: strict)
+        if !strict {
+            permissiveCache.store(decoded, for: raw, expectedGeneration: generation)
+        }
+        return decoded
+    }
+
+    private static func decodeUncached(_ raw: String, strict: Bool) -> TokenInfo? {
         guard let token = bareToken(from: raw) else { return nil }
         let version = String(token[token.index(token.startIndex, offsetBy: 5)])
         guard let payload = base64URLDecode(String(token.dropFirst(6))), !payload.isEmpty else {

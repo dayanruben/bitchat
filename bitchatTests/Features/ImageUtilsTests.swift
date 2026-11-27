@@ -85,4 +85,76 @@ struct ImageUtilsTests {
         #expect(FileManager.default.fileExists(atPath: firstURL.path))
         #expect(FileManager.default.fileExists(atPath: secondURL.path))
     }
+
+    @Test
+    func processImageAtURL_downsamplesAndWritesJpeg() throws {
+        let sourceImage = makePlatformImage(size: CGSize(width: 800, height: 600))
+        let sourceDir = makeTemporaryDirectoryURL("image-src-\(UUID().uuidString)")
+        let outputDir = makeTemporaryDirectoryURL("image-dst-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: sourceDir)
+            try? FileManager.default.removeItem(at: outputDir)
+        }
+
+        let sourceURL = try ImageUtils.processImage(sourceImage, maxDimension: 800, outputDirectory: sourceDir)
+        let downsampledURL = try ImageUtils.processImage(at: sourceURL, maxDimension: 200, outputDirectory: outputDir)
+
+        let data = try Data(contentsOf: downsampledURL)
+        #expect(data.starts(with: Data([0xFF, 0xD8])))
+        let loaded = try #require(ImageDownsampler.loadDownsampledImage(from: downsampledURL, maxPixelSize: 1024))
+        #expect(max(loaded.size.width, loaded.size.height) <= 200.5)
+    }
+
+    @Test
+    func imageDownsampler_cachesAndClearsOnPanicReset() throws {
+        let image = makePlatformImage(size: CGSize(width: 128, height: 128))
+        let dir = makeTemporaryDirectoryURL("image-cache-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let fileURL = try ImageUtils.processImage(image, maxDimension: 128, outputDirectory: dir)
+        #expect(ImageDownsampler.cachedImage(for: fileURL, maxPixelSize: 64) == nil)
+        let decoded = try #require(ImageDownsampler.loadDownsampledImage(from: fileURL, maxPixelSize: 64))
+        let cached = try #require(ImageDownsampler.cachedImage(for: fileURL, maxPixelSize: 64))
+        #expect(decoded === cached)
+
+        ImageDownsampler.resetForPanic()
+        #expect(ImageDownsampler.cachedImage(for: fileURL, maxPixelSize: 64) == nil)
+    }
+
+    @Test
+    func processImageAtURL_acceptsHighResolution24MPPhotoAndDownsamples() throws {
+        // 5712 x 4284 (~24.5 MP) exceeds the incoming BLE 4096 px / 16.7 MP cap
+        // (ImageContainerValidator.maxDimensionPixels), matching modern iPhone
+        // default photos. Outgoing ImageUtils must still accept and downsample it.
+        let dir = makeTemporaryDirectoryURL("image-24mp-\(UUID().uuidString)")
+        let outputDir = makeTemporaryDirectoryURL("image-24mp-out-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+            try? FileManager.default.removeItem(at: outputDir)
+        }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let sourceURL = dir.appendingPathComponent("iphone-24mp.png")
+        try TestImageFixtures.makePNG(width: 5_712, height: 4_284).write(to: sourceURL)
+
+        let downsampledURL = try ImageUtils.processImage(at: sourceURL, maxDimension: 448, outputDirectory: outputDir)
+        let data = try Data(contentsOf: downsampledURL)
+        #expect(data.starts(with: Data([0xFF, 0xD8])))
+        let loaded = try #require(ImageDownsampler.loadDownsampledImage(from: downsampledURL, maxPixelSize: 1024))
+        #expect(max(loaded.size.width, loaded.size.height) <= 448.5)
+    }
+
+    @Test
+    func processImageAtURL_stillRejectsExtremeDecompressionBomb() throws {
+        let dir = makeTemporaryDirectoryURL("image-bomb-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let bombURL = dir.appendingPathComponent("bomb.png")
+        try TestImageFixtures.makePNGBomb(width: 20_000, height: 20_000).write(to: bombURL)
+
+        #expect(throws: ImageUtilsError.self) {
+            try ImageUtils.processImage(at: bombURL)
+        }
+    }
 }
