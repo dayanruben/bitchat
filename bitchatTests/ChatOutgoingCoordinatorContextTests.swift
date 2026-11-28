@@ -73,11 +73,8 @@ private final class MockChatOutgoingContext: ChatOutgoingContext {
     }
 
     // Outbound routing
-    private(set) var recordedActivityKeys: [String] = []
     private(set) var sentMeshMessages: [(content: String, mentions: [String], messageID: String, timestamp: Date)] = []
     private(set) var sentGeohashContexts: [ChatViewModel.GeoOutgoingContext] = []
-
-    func recordPublicActivity(forChannelKey key: String) { recordedActivityKeys.append(key) }
 
     func sendMeshMessage(_ content: String, mentions: [String], messageID: String, timestamp: Date) {
         sentMeshMessages.append((content, mentions, messageID, timestamp))
@@ -179,7 +176,6 @@ struct ChatOutgoingCoordinatorContextTests {
 
         // The mesh send carries the original (untrimmed) content and reuses
         // the echo's message ID and timestamp; activity is stamped for "mesh".
-        #expect(context.recordedActivityKeys == ["mesh"])
         #expect(context.sentMeshMessages.count == 1)
         let sent = context.sentMeshMessages[0]
         #expect(sent.content == "  hello @bob  ")
@@ -197,9 +193,6 @@ struct ChatOutgoingCoordinatorContextTests {
         context.isTeleported = true
 
         coordinator.sendMessage("hello geo")
-        // Geohash sends mine a NIP-13 nonce tag off-main before echoing and
-        // sending; await the send task, then drain the main queue.
-        await coordinator.geohashMiningTask?.value
         await drainMainActorTasks()
 
         // Local echo carries the geohash sender suffix (#last-4-of-pubkey) and
@@ -210,7 +203,6 @@ struct ChatOutgoingCoordinatorContextTests {
         #expect(echo.sender == "me#2222")
         // The echo is told apart as mine by this ID, not by its name.
         #expect(echo.senderPeerID == PeerID(nostr: MockChatOutgoingContext.dummyIdentity.publicKeyHex))
-        #expect(context.recordedActivityKeys == ["geo:u4pruydq"])
         #expect(context.sentGeohashContexts.count == 1)
         let geoContext = context.sentGeohashContexts[0]
         #expect(geoContext.channel == channel)
@@ -244,9 +236,6 @@ struct ChatOutgoingCoordinatorContextTests {
         let second = "second"
         coordinator.sendMessage(first)
         coordinator.sendMessage(second)
-
-        // The stored task is the second send, which awaits the first.
-        await coordinator.geohashMiningTask?.value
         await drainMainActorTasks()
 
         // Local echoes land in send order…

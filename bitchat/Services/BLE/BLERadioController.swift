@@ -50,11 +50,11 @@ final class BLERadioController {
     // Adaptive scanning duty-cycle
     private var scanDutyTimer: DispatchSourceTimer?
     private var dutyResumeWorkItem: DispatchWorkItem?
-    private var dutyEnabled: Bool = true
     private var dutyOnDuration: TimeInterval = TransportConfig.bleDutyOnDuration
     private var dutyOffDuration: TimeInterval = TransportConfig.bleDutyOffDuration
     private var dutyActive: Bool = false
     private var lastScanAllowDuplicates: Bool?
+    private var fragmentScanPauses = BLEFragmentScanPauseTracker<UUID, DispatchWorkItem>()
 
     init(
         queue: DispatchQueue,
@@ -69,6 +69,9 @@ final class BLERadioController {
     deinit {
         dutyResumeWorkItem?.cancel()
         scanDutyTimer?.cancel()
+        for handle in fragmentScanPauses.cancelAll() {
+            handle.cancel()
+        }
     }
 
     // MARK: - Advertising
@@ -81,14 +84,19 @@ final class BLERadioController {
     // MARK: - Scanning
 
     private var desiredAllowDuplicates: Bool {
-        // Allow duplicates while active for faster discovery, except under
-        // Low Power Mode where coalesced CoreBluetooth discoveries avoid
-        // waking the CPU on every BLE advertising beacon.
-        (delegate?.radioIsAppActive() ?? true) && !ProcessInfo.processInfo.isLowPowerModeEnabled
+        // Allow duplicates while active and below the central link budget for
+        // fast discovery. Under Low Power Mode, in background, or once all
+        // central link slots are saturated, coalesced CoreBluetooth discoveries
+        // avoid waking the CPU on every nearby BLE advertising beacon.
+        let isSaturated = linkStateStore.connectedOrConnectingPeripheralCount >= TransportConfig.bleMaxCentralLinks
+        return (delegate?.radioIsAppActive() ?? true)
+            && !ProcessInfo.processInfo.isLowPowerModeEnabled
+            && !isSaturated
     }
 
     func startScanning() {
-        guard delegate?.radioIsPanicSuspended() == false,
+        guard !fragmentScanPauses.isPaused,
+              delegate?.radioIsPanicSuspended() == false,
               let central,
               central.state == .poweredOn,
               !central.isScanning else { return }
@@ -118,7 +126,8 @@ final class BLERadioController {
     /// Ensures scanning is active with up-to-date options (e.g. if Low Power
     /// Mode toggled while a scan was already running).
     private func ensureScanningWithCurrentOptions() {
-        guard delegate?.radioIsPanicSuspended() == false,
+        guard !fragmentScanPauses.isPaused,
+              delegate?.radioIsPanicSuspended() == false,
               let central,
               central.state == .poweredOn else { return }
         let desired = desiredAllowDuplicates
@@ -126,6 +135,48 @@ final class BLERadioController {
             guard lastScanAllowDuplicates != desired else { return }
             central.stopScan()
             lastScanAllowDuplicates = nil
+        }
+        startScanning()
+    }
+
+    func beginFragmentScanPause(token: UUID, duration: TimeInterval) {
+        guard delegate?.radioIsPanicSuspended() == false,
+              let central,
+              central.state == .poweredOn,
+              central.isScanning || scanDutyTimer != nil || fragmentScanPauses.isPaused else { return }
+        if central.isScanning {
+            central.stopScan()
+            lastScanAllowDuplicates = nil
+        }
+        let timeoutWork = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.fragmentScanPauses.timeoutFired(token: token) {
+                self.resumeScanningAfterFragmentPauseIfAllowed()
+            }
+        }
+        let transition = fragmentScanPauses.begin(token: token, timeoutHandle: timeoutWork)
+        transition.replacedHandle?.cancel()
+        queue.asyncAfter(deadline: .now() + duration, execute: timeoutWork)
+    }
+
+    func endFragmentScanPause(token: UUID) {
+        let result = fragmentScanPauses.end(token: token)
+        result.removedHandle?.cancel()
+        if result.shouldResumeScanning {
+            resumeScanningAfterFragmentPauseIfAllowed()
+        }
+    }
+
+    func cancelFragmentScanPauses() {
+        for handle in fragmentScanPauses.cancelAll() {
+            handle.cancel()
+        }
+    }
+
+    private func resumeScanningAfterFragmentPauseIfAllowed() {
+        guard !fragmentScanPauses.isPaused else { return }
+        if scanDutyTimer != nil && !dutyActive {
+            return
         }
         startScanning()
     }
@@ -140,7 +191,6 @@ final class BLERadioController {
             now: Date()
         )
         let scanPlan = BLEScanDutyPolicy.plan(
-            dutyEnabled: dutyEnabled,
             appIsActive: delegate?.radioIsAppActive() ?? true,
             connectedCount: connectedCount,
             hasRecentTraffic: hasRecentTraffic,
@@ -363,6 +413,7 @@ final class BLERadioController {
     /// Panic wipe: drop the candidate queue, backoff state, and RSSI
     /// adaptation with the identity they served.
     func reset() {
+        cancelFragmentScanPauses()
         scheduler.reset()
     }
 
@@ -473,5 +524,153 @@ private extension CBPeripheralState {
         @unknown default:
             return .disconnected
         }
+    }
+}
+
+
+// MARK: - Scan Duty Policy
+
+enum BLEScanDutyPlan: Equatable {
+    case continuous
+    case dutyCycle(onDuration: TimeInterval, offDuration: TimeInterval)
+}
+
+enum BLEScanDutyPolicy {
+    static func plan(
+        appIsActive: Bool,
+        connectedCount: Int,
+        hasRecentTraffic: Bool,
+        highDegreeThreshold: Int = TransportConfig.bleHighDegreeThreshold,
+        lowPowerMode: Bool = false
+    ) -> BLEScanDutyPlan {
+        if lowPowerMode && appIsActive && !hasRecentTraffic {
+            if connectedCount >= highDegreeThreshold {
+                return .dutyCycle(onDuration: 2.0, offDuration: 20.0)
+            }
+            return .dutyCycle(
+                onDuration: TransportConfig.bleDutyOnDurationDense,
+                offDuration: TransportConfig.bleDutyOffDurationDense
+            )
+        }
+
+        // Duty-cycle whenever the app is active and idle—including solo and
+        // 1–2 peer meshes—so idle phones don't run continuous foreground scans.
+        // Recent active traffic briefly holds continuous scanning for snappy
+        // convergence; background scans stay continuous because CoreBluetooth
+        // already hardware-coalesces them.
+        let shouldDutyCycle = appIsActive && !hasRecentTraffic
+
+        guard shouldDutyCycle else {
+            return .continuous
+        }
+
+        if connectedCount >= highDegreeThreshold {
+            return .dutyCycle(
+                onDuration: TransportConfig.bleDutyOnDurationDense,
+                offDuration: TransportConfig.bleDutyOffDurationDense
+            )
+        }
+
+        return .dutyCycle(
+            onDuration: TransportConfig.bleDutyOnDuration,
+            offDuration: TransportConfig.bleDutyOffDuration
+        )
+    }
+}
+
+// MARK: - Recent Peripheral Cache
+
+/// Remembers recently seen bitchat peripherals so pending background connects
+/// can be armed when the app leaves the foreground.
+final class BLERecentPeripheralCache<Peripheral> {
+    private struct Entry {
+        let peripheral: Peripheral
+        var lastSeen: Date
+    }
+
+    private var entries: [String: Entry] = [:]
+    private let capacity: Int
+    private let maxAge: TimeInterval
+
+    init(
+        capacity: Int = TransportConfig.bleRecentPeripheralCacheCap,
+        maxAge: TimeInterval = TransportConfig.bleRecentPeripheralMaxAgeSeconds
+    ) {
+        self.capacity = capacity
+        self.maxAge = maxAge
+    }
+
+    var count: Int { entries.count }
+
+    func record(_ peripheral: Peripheral, peripheralID: String, at now: Date) {
+        entries[peripheralID] = Entry(peripheral: peripheral, lastSeen: now)
+        guard entries.count > capacity else { return }
+        if let stalest = entries.min(by: { $0.value.lastSeen < $1.value.lastSeen }) {
+            entries.removeValue(forKey: stalest.key)
+        }
+    }
+
+    func reconnectTargets(
+        now: Date,
+        limit: Int,
+        excluding: (String) -> Bool
+    ) -> [(peripheralID: String, peripheral: Peripheral)] {
+        let cutoff = now.addingTimeInterval(-maxAge)
+        entries = entries.filter { $0.value.lastSeen >= cutoff }
+        guard limit > 0 else { return [] }
+        return entries
+            .filter { !excluding($0.key) }
+            .sorted { $0.value.lastSeen > $1.value.lastSeen }
+            .prefix(limit)
+            .map { (peripheralID: $0.key, peripheral: $0.value.peripheral) }
+    }
+}
+
+// MARK: - Fragment Scan Pause Tracker
+
+/// Tracks overlapping fragment-train scan pauses so scanning stays paused until
+/// every active train finishes or times out, and all pending timeouts cancel
+/// cleanly on stop, panic reset, or Bluetooth power-off.
+struct BLEFragmentScanPauseTracker<Token: Hashable, TimeoutHandle> {
+    private var activePauses: [Token: TimeoutHandle] = [:]
+
+    var isPaused: Bool {
+        !activePauses.isEmpty
+    }
+
+    var activeCount: Int {
+        activePauses.count
+    }
+
+    @discardableResult
+    mutating func begin(
+        token: Token,
+        timeoutHandle: TimeoutHandle
+    ) -> (becamePaused: Bool, replacedHandle: TimeoutHandle?) {
+        let wasPaused = isPaused
+        let replacedHandle = activePauses.updateValue(timeoutHandle, forKey: token)
+        return (becamePaused: !wasPaused, replacedHandle: replacedHandle)
+    }
+
+    mutating func end(
+        token: Token
+    ) -> (removedHandle: TimeoutHandle?, shouldResumeScanning: Bool) {
+        guard let removed = activePauses.removeValue(forKey: token) else {
+            return (nil, false)
+        }
+        return (removed, activePauses.isEmpty)
+    }
+
+    mutating func timeoutFired(token: Token) -> Bool {
+        guard activePauses.removeValue(forKey: token) != nil else {
+            return false
+        }
+        return activePauses.isEmpty
+    }
+
+    mutating func cancelAll() -> [TimeoutHandle] {
+        let handles = Array(activePauses.values)
+        activePauses.removeAll(keepingCapacity: false)
+        return handles
     }
 }

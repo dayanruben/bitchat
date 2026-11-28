@@ -24,7 +24,8 @@ private func makeSmokeViewModel() -> (viewModel: ChatViewModel, transport: MockT
         keychain: keychain,
         idBridge: idBridge,
         identityManager: identityManager,
-        transport: transport
+        transport: transport,
+        locationManager: makeSmokeLocationManager()
     )
 
     return (viewModel, transport, identityManager)
@@ -73,10 +74,9 @@ private func makeSmokeLocationManager() -> LocationChannelManager {
 
 @MainActor
 private func makeSmokeFeatureModels(for viewModel: ChatViewModel) -> SmokeFeatureModels {
-    let locationManager = makeSmokeLocationManager()
     let conversations = viewModel.conversations
     let publicChatModel = PublicChatModel(conversations: conversations)
-    let locationChannelsModel = LocationChannelsModel(manager: locationManager)
+    let locationChannelsModel = LocationChannelsModel(manager: viewModel.locationManager)
     let privateInboxModel = PrivateInboxModel(conversations: conversations)
     let appChromeModel = AppChromeModel(
         chatViewModel: viewModel,
@@ -147,15 +147,9 @@ private struct ContentPeopleSheetHarness: View {
     @State private var isAtBottomPrivate = true
     @StateObject private var voiceRecordingVM = VoiceRecordingViewModel()
     @FocusState private var isTextFieldFocused: Bool
-    #if os(iOS)
-    @State private var showImagePicker = false
-    @State private var imagePickerSourceType: UIImagePickerController.SourceType = .photoLibrary
-    #else
-    @State private var showMacImagePicker = false
-    #endif
+    @State private var mediaPickerMode: MediaPickerMode?
 
     var body: some View {
-        #if os(iOS)
         ContentPeopleSheetView(
             showSidebar: $showSidebar,
             draftModel: draftModel,
@@ -168,25 +162,8 @@ private struct ContentPeopleSheetHarness: View {
             voiceRecordingVM: voiceRecordingVM,
             headerHeight: 44,
             onSendMessage: {},
-            showImagePicker: $showImagePicker,
-            imagePickerSourceType: $imagePickerSourceType
+            mediaPickerMode: $mediaPickerMode
         )
-        #else
-        ContentPeopleSheetView(
-            showSidebar: $showSidebar,
-            draftModel: draftModel,
-            selectedMessageSender: $selectedMessageSender,
-            selectedMessageSenderID: $selectedMessageSenderID,
-            imagePreviewURL: $imagePreviewURL,
-            windowCountPrivate: $windowCountPrivate,
-            isAtBottomPrivate: $isAtBottomPrivate,
-            isTextFieldFocused: $isTextFieldFocused,
-            voiceRecordingVM: voiceRecordingVM,
-            headerHeight: 44,
-            onSendMessage: {},
-            showMacImagePicker: $showMacImagePicker
-        )
-        #endif
     }
 }
 
@@ -315,21 +292,16 @@ struct ViewSmokeTests {
 
         transport.peerFingerprints[peerID] = fingerprint
         transport.updatePeerSnapshots([makeSnapshot(peerID: peerID, nickname: "Verifier", noiseByte: 0x33)])
-        featureModels.privateConversationModel.startConversation(with: peerID)
+        featureModels.privateConversationModel.openConversation(for: peerID)
         viewModel.verifiedFingerprints.insert(fingerprint)
-
-        let image = try makeCGImage()
 
         let myQR = MyQRView(qrString: "bitchat://verify?name=alice&npub=npub1test")
         let qrCode = QRCodeImage(data: "bitchat://verify?hello=world", size: 96)
-        let imageWrapper = ImageWrapper(image: image)
 
         _ = myQR.body
         _ = qrCode.body
-        _ = imageWrapper.body
         _ = mount(myQR)
         _ = mount(qrCode)
-        _ = mount(imageWrapper)
         _ = mount(
             VerificationSheetView(
                 isPresented: Binding(
@@ -555,7 +527,7 @@ struct ViewSmokeTests {
         _ = mount(installSmokeEnvironment(ContentView(), featureModels: featureModels))
         _ = mount(installSmokeEnvironment(ContentPeopleSheetHarness(draftModel: featureModels.composerDraftModel), featureModels: featureModels))
 
-        featureModels.privateConversationModel.startConversation(with: peerID)
+        featureModels.privateConversationModel.openConversation(for: peerID)
         try? await Task.sleep(nanoseconds: 50_000_000)
 
         _ = mount(installSmokeEnvironment(ContentPeopleSheetHarness(draftModel: featureModels.composerDraftModel), featureModels: featureModels))
@@ -837,5 +809,180 @@ struct ViewSmokeTests {
 
         #expect(preview.videoPreviewLayer.videoGravity == .resizeAspectFill)
         #endif
+    }
+
+    #if os(iOS)
+    @Test("Liquid Glass chat scroll view does not double-inset or offset the first message")
+    func liquidGlassMessageList_doesNotDoubleTopInsetFirstMessage() async {
+        let (viewModel, _, _) = makeSmokeViewModel()
+        let featureModels = makeSmokeFeatureModels(for: viewModel)
+
+        // Start in a populated #mesh channel (scrolled down) before switching
+        // to an initially empty #ez channel where 2 Tor system messages arrive
+        // with the keyboard up — reproducing channel switch, empty→populated
+        // transition, and keyboard safe-area changes in one test.
+        let meshHistory: [BitchatMessage] = (0..<80).map { i in
+            BitchatMessage(
+                id: "mesh-\(i)",
+                sender: "alice",
+                content: "crowded room message number \(i)",
+                timestamp: Date(timeIntervalSince1970: 1_700_000_000 + Double(i)),
+                isRelay: false
+            )
+        }
+        viewModel.conversations.appendBatch(meshHistory, to: .mesh)
+
+        let rootView = installSmokeEnvironment(
+            ContentView().environment(\.appTheme, .liquidGlass),
+            featureModels: featureModels
+        )
+        let host = UIHostingController(rootView: rootView)
+        let windowScene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let window: UIWindow
+        if let windowScene {
+            window = UIWindow(windowScene: windowScene)
+            window.frame = windowScene.coordinateSpace.bounds
+        } else {
+            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        }
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        host.view.frame = window.bounds
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        // Switch to empty #ez and simulate the keyboard opening.
+        let channel = GeohashChannel(level: .region, geohash: "ez")
+        featureModels.locationChannelsModel.select(.location(channel))
+        viewModel.conversations.setActiveChannel(.location(channel))
+        host.additionalSafeAreaInsets = UIEdgeInsets(top: 0, left: 0, bottom: 330, right: 0)
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        _ = await TestHelpers.waitUntil {
+            featureModels.publicChatModel.activeChannel == .location(channel)
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        // Now deliver two system messages (matching the Tor restart screenshot).
+        let first = BitchatMessage(
+            id: "sys-1",
+            sender: "system",
+            content: "tor is restarting to restore connectivity...",
+            timestamp: Date(timeIntervalSince1970: 1_700_001_000),
+            isRelay: false
+        )
+        let second = BitchatMessage(
+            id: "sys-2",
+            sender: "system",
+            content: "tor restarted. network routing restored.",
+            timestamp: Date(timeIntervalSince1970: 1_700_001_001),
+            isRelay: false
+        )
+        viewModel.conversations.append(first, to: .geohash("ez"))
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        viewModel.conversations.append(second, to: .geohash("ez"))
+        // Let followToBottom + 50ms retry settle.
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+
+        #expect(featureModels.publicChatModel.activeChannel == .location(channel))
+        #expect(featureModels.publicChatModel.messages.count == 2)
+
+        func findScrollView(in view: UIView) -> UIScrollView? {
+            if let sv = view as? UIScrollView { return sv }
+            for subview in view.subviews {
+                if let found = findScrollView(in: subview) { return found }
+            }
+            return nil
+        }
+
+        func assertSingleTopInset(for hostController: UIHostingController<some View>, label: String) {
+            let scrollView = findScrollView(in: hostController.view)
+            #expect(scrollView != nil, "\(label): expected UIScrollView")
+            guard let scrollView else { return }
+
+            let frameTopInWindow = scrollView.superview?.convert(scrollView.frame.origin, to: window).y ?? scrollView.frame.origin.y
+            let contentZeroInWindow = scrollView.convert(CGPoint.zero, to: window).y
+            let hostSafeTop = hostController.view.safeAreaInsets.top
+            let expectedMinTop = hostSafeTop + 40
+            let expectedMaxTop = hostSafeTop + 80
+
+            #expect(
+                frameTopInWindow <= hostSafeTop + 1,
+                "\(label): ScrollView frame should extend full-bleed behind the floating header (frameTop=\(frameTopInWindow), hostSafeTop=\(hostSafeTop))"
+            )
+            #expect(
+                scrollView.safeAreaInsets.top <= hostSafeTop + 1,
+                "\(label): ScrollView must not receive stacked safeAreaInsets from nested .safeAreaInset modifiers (scrollSafeTop=\(scrollView.safeAreaInsets.top), hostSafeTop=\(hostSafeTop))"
+            )
+            #expect(
+                contentZeroInWindow >= expectedMinTop && contentZeroInWindow <= expectedMaxTop,
+                "\(label): First message top (\(contentZeroInWindow)) outside single-header range [\(expectedMinTop), \(expectedMaxTop)] (adjustedContentInset=\(scrollView.adjustedContentInset), contentInset=\(scrollView.contentInset), contentOffset=\(scrollView.contentOffset), contentSize=\(scrollView.contentSize))"
+            )
+        }
+
+        assertSingleTopInset(for: host, label: "#ez with 2 system messages + keyboard")
+
+        // Also verify fresh launch -> banner dismissed -> empty #mesh -> 1 message + keyboard.
+        let (meshViewModel, _, _) = makeSmokeViewModel()
+        let meshFeatureModels = makeSmokeFeatureModels(for: meshViewModel)
+        meshViewModel.bluetoothState = .poweredOff
+        let meshHost = UIHostingController(rootView: installSmokeEnvironment(
+            ContentView().environment(\.appTheme, .liquidGlass),
+            featureModels: meshFeatureModels
+        ))
+        window.rootViewController = meshHost
+        meshHost.view.frame = window.bounds
+        meshHost.view.setNeedsLayout()
+        meshHost.view.layoutIfNeeded()
+        try? await Task.sleep(nanoseconds: 120_000_000)
+
+        meshViewModel.bluetoothState = .poweredOn
+        meshHost.additionalSafeAreaInsets = UIEdgeInsets(top: 0, left: 0, bottom: 330, right: 0)
+        meshViewModel.conversations.append(BitchatMessage(
+            id: "yo-1",
+            sender: "anon6990",
+            content: "Yo",
+            timestamp: Date(timeIntervalSince1970: 1_700_001_000),
+            isRelay: false
+        ), to: .mesh)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        meshHost.view.setNeedsLayout()
+        meshHost.view.layoutIfNeeded()
+
+        assertSingleTopInset(for: meshHost, label: "fresh #mesh after banner dismissal + 1 message + keyboard")
+        window.isHidden = true
+    }
+    #endif
+
+    @Test("Message list external URL allowlist permits only safe schemes")
+    func messageListExternalURLAllowlist() throws {
+        let allowed = [
+            "https://bitchat.free",
+            "http://example.com",
+            "HTTPS://EXAMPLE.COM/path",
+            "cashu:cashuA_test",
+            "lightning:lnbc1test",
+            "bitchat://verify?name=alice"
+        ]
+        for raw in allowed {
+            let url = try #require(URL(string: raw))
+            #expect(MessageListExternalURLPolicy.isAllowed(url), "Expected \(raw) to be allowed")
+        }
+
+        let blocked = [
+            "tel:+15551234567",
+            "sms:+15551234567",
+            "mailto:alice@example.com",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "itms-services://?action=download-manifest"
+        ]
+        for raw in blocked {
+            let url = try #require(URL(string: raw))
+            #expect(!MessageListExternalURLPolicy.isAllowed(url), "Expected \(raw) to be blocked")
+        }
     }
 }

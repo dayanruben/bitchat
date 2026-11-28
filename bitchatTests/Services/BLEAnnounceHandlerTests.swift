@@ -11,7 +11,7 @@ struct BLEAnnounceHandlerTests {
         var persistedSigningKeyQueries: [PeerID] = []
         var authenticatedSigningPublicKey: Data?
         var signatureValid = true
-        var linkState: (hasPeripheral: Bool, hasCentral: Bool) = (false, false)
+        var linkState: BLEDirectLinkState = .none
         var linkBoundToOtherPeer = false
         var upsertResult: BLEPeerAnnounceUpdate? = BLEPeerAnnounceUpdate(isNewPeer: false, wasDisconnected: false, previousNickname: nil)
         var dedupSeenIDs: Set<String> = []
@@ -186,19 +186,13 @@ struct BLEAnnounceHandlerTests {
         #expect(recorder.upsertCalls.isEmpty)
         #expect(recorder.topologyUpdates.isEmpty)
         #expect(recorder.afterglowDelays.isEmpty)
-        // Original behavior: list refresh and announce-back still occur for
-        // unverified announces.
-        #expect(recorder.uiEventDeliveries.count == 1)
-        #expect(recorder.uiEventDeliveries.first?.notifyPeerConnected == false)
-        #expect(recorder.uiEventDeliveries.first?.scheduleInitialSync == false)
-        // Identity persistence MUST NOT occur for unverified announces:
-        // persisting would let an attacker who replays a victim's noisePublicKey
-        // overwrite the victim's stored signing key/nickname (identity poisoning).
+        // Unverified announces MUST NOT trigger UI refreshes, announce-backs,
+        // identity persistence, or gossip tracking (prevents spoofed announce
+        // floods from amplifying broadcasts and churning the main thread).
+        #expect(recorder.uiEventDeliveries.isEmpty)
         #expect(recorder.persistedIdentities.isEmpty)
-        // Nor gossip tracking: an unsigned announce is free to mint, so
-        // tracking it let junk identities fill the sync store and filter.
         #expect(recorder.trackedPackets.isEmpty)
-        #expect(recorder.announceBacks == 1)
+        #expect(recorder.announceBacks == 0)
     }
 
     @Test
@@ -222,8 +216,8 @@ struct BLEAnnounceHandlerTests {
         #expect(result?.isVerified == false)
         #expect(recorder.verifySignatureCalls.count == 1)
         #expect(recorder.upsertCalls.isEmpty)
-        #expect(recorder.uiEventDeliveries.count == 1)
-        #expect(recorder.uiEventDeliveries.first?.notifyPeerConnected == false)
+        #expect(recorder.uiEventDeliveries.isEmpty)
+        #expect(recorder.announceBacks == 0)
         #expect(recorder.trackedPackets.isEmpty)
     }
 
@@ -393,7 +387,7 @@ struct BLEAnnounceHandlerTests {
 
         let recorder = Recorder()
         recorder.linkBoundToOtherPeer = true
-        recorder.linkState = (hasPeripheral: false, hasCentral: true)
+        recorder.linkState = BLEDirectLinkState(hasPeripheral: false, hasCentral: true)
         let handler = makeHandler(recorder: recorder, now: now)
 
         handler.handle(packet, from: peerID)
@@ -430,7 +424,7 @@ struct BLEAnnounceHandlerTests {
         // First replay: the link still belongs to the replayer and the victim
         // has no live link of its own — the connected shortcut is denied.
         recorder.linkBoundToOtherPeer = true
-        recorder.linkState = (hasPeripheral: false, hasCentral: false)
+        recorder.linkState = .none
         handler.handle(packet, from: victim)
         #expect(recorder.upsertCalls.count == 1)
         #expect(recorder.upsertCalls.first?.isConnected == false)
@@ -439,7 +433,7 @@ struct BLEAnnounceHandlerTests {
         // rotation-heal path, containment-checked in BLEService). A second
         // replay now finds the link owned by the claimed peer …
         recorder.linkBoundToOtherPeer = false
-        recorder.linkState = (hasPeripheral: false, hasCentral: true)
+        recorder.linkState = BLEDirectLinkState(hasPeripheral: false, hasCentral: true)
         handler.handle(packet, from: victim)
 
         // … and the absent victim reads as connected: the residual gap.
@@ -543,8 +537,8 @@ struct BLEAnnounceHandlerTests {
         #expect(recorder.upsertCalls.isEmpty)
         #expect(recorder.persistedIdentities.isEmpty)
         #expect(recorder.topologyUpdates.isEmpty)
-        #expect(recorder.uiEventDeliveries.count == 1)
-        #expect(recorder.uiEventDeliveries.first?.notifyPeerConnected == false)
+        #expect(recorder.uiEventDeliveries.isEmpty)
+        #expect(recorder.announceBacks == 0)
         // The impersonation announce is not carried for sync either.
         #expect(recorder.trackedPackets.isEmpty)
     }
@@ -577,8 +571,8 @@ struct BLEAnnounceHandlerTests {
         #expect(recorder.upsertCalls.isEmpty)
         #expect(recorder.persistedIdentities.isEmpty)
         #expect(recorder.topologyUpdates.isEmpty)
-        #expect(recorder.uiEventDeliveries.count == 1)
-        #expect(recorder.uiEventDeliveries.first?.notifyPeerConnected == false)
+        #expect(recorder.uiEventDeliveries.isEmpty)
+        #expect(recorder.announceBacks == 0)
     }
 
     @Test
@@ -653,8 +647,8 @@ struct BLEAnnounceHandlerTests {
         #expect(recorder.upsertCalls.count == 1)
         #expect(recorder.persistedIdentities.isEmpty)
         #expect(recorder.topologyUpdates.isEmpty)
-        #expect(recorder.uiEventDeliveries.count == 1)
-        #expect(recorder.uiEventDeliveries.first?.notifyPeerConnected == false)
+        #expect(recorder.uiEventDeliveries.isEmpty)
+        #expect(recorder.announceBacks == 0)
         #expect(recorder.afterglowDelays.isEmpty)
     }
 
@@ -678,8 +672,8 @@ struct BLEAnnounceHandlerTests {
 
         #expect(result?.isVerified == false)
         #expect(recorder.upsertCalls.isEmpty)
-        #expect(recorder.uiEventDeliveries.count == 1)
-        #expect(recorder.uiEventDeliveries.first?.notifyPeerConnected == false)
+        #expect(recorder.uiEventDeliveries.isEmpty)
+        #expect(recorder.announceBacks == 0)
     }
 
     @Test
@@ -714,7 +708,7 @@ struct BLEAnnounceHandlerTests {
             verifySignature: { packet, signingPublicKey in
                 victim.verifyPacketSignature(packet, publicKey: signingPublicKey)
             },
-            linkState: { _ in (hasPeripheral: true, hasCentral: false) },
+            linkState: { _ in BLEDirectLinkState(hasPeripheral: true, hasCentral: false) },
             linkBoundToOtherPeer: { _, _ in false },
             withRegistryBarrier: { body in body() },
             upsertVerifiedAnnounce: { peerID, announcement, isConnected, now in
@@ -829,7 +823,7 @@ struct BLEAnnounceHandlerTests {
                 verifySignature: { packet, signingPublicKey in
                     victim.verifyPacketSignature(packet, publicKey: signingPublicKey)
                 },
-                linkState: { _ in (hasPeripheral: true, hasCentral: false) },
+                linkState: { _ in BLEDirectLinkState(hasPeripheral: true, hasCentral: false) },
                 linkBoundToOtherPeer: { _, _ in false },
                 withRegistryBarrier: { body in body() },
                 upsertVerifiedAnnounce: { peerID, announcement, isConnected, now in

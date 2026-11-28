@@ -2,7 +2,6 @@ import SwiftUI
 
 struct ContentHeaderView: View {
     @EnvironmentObject private var appChromeModel: AppChromeModel
-    @EnvironmentObject private var verificationModel: VerificationModel
     @EnvironmentObject private var locationChannelsModel: LocationChannelsModel
     @EnvironmentObject private var peerListModel: PeerListModel
     @EnvironmentObject private var boardAlertsModel: BoardAlertsModel
@@ -12,7 +11,6 @@ struct ContentHeaderView: View {
     @ThemedPalette private var palette
 
     @Binding var showSidebar: Bool
-    @Binding var showVerifySheet: Bool
     var isNicknameFieldFocused: FocusState<Bool>.Binding
 
     let headerHeight: CGFloat
@@ -84,7 +82,7 @@ struct ContentHeaderView: View {
                     .fixedSize()
 
                 TextField(
-                    "content.input.nickname_placeholder",
+                    String(localized: "content.input.nickname_placeholder"),
                     text: Binding(
                         get: { appChromeModel.nickname },
                         set: { appChromeModel.setNickname($0) }
@@ -314,10 +312,6 @@ struct ContentHeaderView: View {
                 )
             }
             .layoutPriority(3)
-            .sheet(isPresented: $showVerifySheet) {
-                VerificationSheetView(isPresented: $showVerifySheet)
-                    .environmentObject(verificationModel)
-            }
         }
         // Fixed height is load-bearing: children fill the bar with
         // .frame(maxHeight: .infinity) tap targets, so an open-ended
@@ -357,10 +351,10 @@ struct ContentHeaderView: View {
         .onChange(of: locationChannelsModel.permissionState) { _ in
             locationChannelsModel.refreshMeshChannelsIfNeeded()
         }
-        .alert("content.alert.screenshot.title", isPresented: $appChromeModel.showScreenshotPrivacyWarning) {
-            Button("common.ok", role: .cancel) {}
+        .alert(String(localized: "content.alert.screenshot.title"), isPresented: $appChromeModel.showScreenshotPrivacyWarning) {
+            Button(String(localized: "common.ok"), role: .cancel) {}
         } message: {
-            Text("content.alert.screenshot.message")
+            Text(String(localized: "content.alert.screenshot.message"))
         }
         .confirmationDialog(
             String(localized: "channel.share.precision_warning.title", defaultValue: "share a precise location channel?", comment: "Title of the confirmation before sharing a neighborhood-or-finer geohash invite"),
@@ -373,7 +367,7 @@ struct ContentHeaderView: View {
                 }
                 pendingShareGeohash = nil
             }
-            Button("common.cancel", role: .cancel) {
+            Button(String(localized: "common.cancel"), role: .cancel) {
                 pendingShareGeohash = nil
             }
         } message: {

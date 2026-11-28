@@ -45,11 +45,15 @@ struct CourierEndToEndTests {
         }
     }
 
-    private final class NoiseCaptureDelegate: BitchatDelegate {
+    private final class NoiseCaptureDelegate: TransportEventDelegate {
         private let lock = NSLock()
         private var payloads: [(peerID: PeerID, type: NoisePayloadType, payload: Data)] = []
 
-        func didReceiveNoisePayload(from peerID: PeerID, type: NoisePayloadType, payload: Data, timestamp: Date) {
+        @MainActor
+        func didReceiveTransportEvent(_ event: TransportEvent) {
+            guard case let .noisePayloadReceived(peerID, type, payload, _) = event else {
+                return
+            }
             lock.lock(); payloads.append((peerID, type, payload)); lock.unlock()
         }
 
@@ -57,14 +61,6 @@ struct CourierEndToEndTests {
             lock.lock(); defer { lock.unlock() }
             return payloads
         }
-
-        // Unused BitchatDelegate requirements.
-        func didReceiveMessage(_ message: BitchatMessage) {}
-        func didConnectToPeer(_ peerID: PeerID) {}
-        func didDisconnectFromPeer(_ peerID: PeerID) {}
-        func didUpdatePeerList(_ peers: [PeerID]) {}
-        func didUpdateBluetoothState(_ state: CBManagerState) {}
-        func didReceivePublicMessage(from peerID: PeerID, nickname: String, content: String, timestamp: Date, messageID: String?) {}
     }
 
     private func makeService(identityManager: MockIdentityManager? = nil) -> BLEService {
@@ -121,7 +117,7 @@ struct CourierEndToEndTests {
         carol.courierDepositPolicy = { _, _ in .favorite }
 
         let bobDelegate = NoiseCaptureDelegate()
-        bob.delegate = bobDelegate
+        bob.eventDelegate = bobDelegate
 
         let aliceOut = PacketTap()
         alice._test_onOutboundPacket = aliceOut.record
@@ -169,7 +165,7 @@ struct CourierEndToEndTests {
 
         let handedOver = await TestHelpers.waitUntil(
             { carolOut.first(ofType: .courierEnvelope) != nil },
-            timeout: TestConstants.negativeWaitWindow
+            timeout: TestConstants.settleTimeout
         )
         #expect(handedOver)
         // With CoreBluetooth disabled there is no physical link for the send
@@ -208,7 +204,7 @@ struct CourierEndToEndTests {
         carol.courierDepositPolicy = { _, _ in .favorite }
 
         let bobDelegate = NoiseCaptureDelegate()
-        bob.delegate = bobDelegate
+        bob.eventDelegate = bobDelegate
         let aliceOut = PacketTap()
         alice._test_onOutboundPacket = aliceOut.record
         let carolOut = PacketTap()
@@ -263,11 +259,8 @@ struct CourierEndToEndTests {
         // sender is absent from Bob's registry, so no fingerprint resolves at
         // delivery time.
         bob._test_handlePacket(handoverPacket, fromPeerID: carol.myPeerID)
-        let delivered = await TestHelpers.waitUntil(
-            { !bobDelegate.snapshot().isEmpty },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!delivered)
+        await bob._test_drainAllPipelines()
+        #expect(bobDelegate.snapshot().isEmpty)
     }
 
     @Test func unverifiedAnnounceDoesNotTriggerCourierHandover() async throws {
@@ -308,17 +301,14 @@ struct CourierEndToEndTests {
         let forgedAnnounce = try makeUnsignedAnnounce(from: bob)
         carol._test_handlePacket(forgedAnnounce, fromPeerID: bob.myPeerID, preseedPeer: false)
 
-        let leakedOnUnverifiedAnnounce = await TestHelpers.waitUntil(
-            { carolOut.count(ofType: .courierEnvelope) > 0 },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!leakedOnUnverifiedAnnounce)
+        await carol._test_drainAllPipelines()
+        #expect(carolOut.count(ofType: .courierEnvelope) == 0)
         #expect(!carol.courierStore.isEmpty)
 
         bob.sendBroadcastAnnounce()
         let announced = await TestHelpers.waitUntil(
             { bobOut.first(ofType: .announce) != nil },
-            timeout: TestConstants.negativeWaitWindow
+            timeout: TestConstants.settleTimeout
         )
         #expect(announced)
         let verifiedAnnounce = try #require(bobOut.first(ofType: .announce))
@@ -326,7 +316,7 @@ struct CourierEndToEndTests {
 
         let handedOver = await TestHelpers.waitUntil(
             { carolOut.count(ofType: .courierEnvelope) == 1 },
-            timeout: TestConstants.negativeWaitWindow
+            timeout: TestConstants.settleTimeout
         )
         #expect(handedOver)
         #expect(!carol.courierStore.isEmpty)
@@ -385,16 +375,17 @@ struct CourierEndToEndTests {
 
         let remoteHandover = await TestHelpers.waitUntil(
             { carolOut.count(ofType: .courierEnvelope) == 1 },
-            timeout: TestConstants.negativeWaitWindow
+            timeout: TestConstants.settleTimeout
         )
         #expect(remoteHandover)
         #expect(!carol.courierStore.isEmpty)
 
         // A second relayed announce inside the cooldown must not re-flood
         // the same envelope. The original announce's dedup key is consumed
-        // (sender/timestamp/payload — TTL excluded), so use a fresh announce;
-        // wait out the 1s announce throttle first.
-        try await Task.sleep(nanoseconds: 1_100_000_000)
+        // (sender/timestamp/payload — TTL excluded), so reset the announce
+        // throttle and advance past the previous millisecond timestamp.
+        bob._test_resetAnnounceThrottle()
+        try await Task.sleep(nanoseconds: 2_000_000)
         bob.sendBroadcastAnnounce()
         let reannounced = await TestHelpers.waitUntil(
             { bobOut.all(ofType: .announce).contains { $0.timestamp != directAnnounce.timestamp } },
@@ -408,11 +399,8 @@ struct CourierEndToEndTests {
         relayedFreshAnnounce.ttl = freshAnnounce.ttl - 1
         carol._test_handlePacket(relayedFreshAnnounce, fromPeerID: bob.myPeerID, preseedPeer: false)
 
-        let refloodedInCooldown = await TestHelpers.waitUntil(
-            { carolOut.count(ofType: .courierEnvelope) > 1 },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!refloodedInCooldown)
+        await carol._test_drainAllPipelines()
+        #expect(carolOut.count(ofType: .courierEnvelope) == 1)
         #expect(!carol.courierStore.isEmpty)
 
         // A peer-level Noise session is still insufficient without a physical
@@ -420,7 +408,8 @@ struct CourierEndToEndTests {
         // harness deliberately has no such link proof, so restoring the
         // unsigned direct TTL cannot authorize destructive handover.
         try establishNoiseSession(between: carol, and: bob)
-        try await Task.sleep(nanoseconds: 1_100_000_000)
+        bob._test_resetAnnounceThrottle()
+        try await Task.sleep(nanoseconds: 2_000_000)
         bob.sendBroadcastAnnounce()
         let announcedAgain = await TestHelpers.waitUntil(
             { bobOut.all(ofType: .announce).contains { $0.timestamp != directAnnounce.timestamp && $0.timestamp != freshAnnounce.timestamp } },
@@ -432,11 +421,8 @@ struct CourierEndToEndTests {
         )
         carol._test_handlePacket(directAgain, fromPeerID: bob.myPeerID, preseedPeer: false)
 
-        let handedOverWithoutLinkProof = await TestHelpers.waitUntil(
-            { carolOut.count(ofType: .courierEnvelope) > 1 },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!handedOverWithoutLinkProof)
+        await carol._test_drainAllPipelines()
+        #expect(carolOut.count(ofType: .courierEnvelope) == 1)
         #expect(!carol.courierStore.isEmpty)
     }
 
@@ -455,11 +441,8 @@ struct CourierEndToEndTests {
             via: [carol.myPeerID]
         ))
 
-        let queuedPacket = await TestHelpers.waitUntil(
-            { aliceOut.first(ofType: .courierEnvelope) != nil },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!queuedPacket)
+        await alice._test_drainAllPipelines()
+        #expect(aliceOut.first(ofType: .courierEnvelope) == nil)
     }
 
     @Test func depositFromUntrustedPeerIsRejected() async throws {
@@ -492,11 +475,8 @@ struct CourierEndToEndTests {
         let packet = try #require(alice.signPacket(unsigned))
 
         carol._test_handlePacket(packet, fromPeerID: alicePeerID, signingPublicKey: alice.getSigningPublicKeyData())
-        let stored = await TestHelpers.waitUntil(
-            { !carol.courierStore.isEmpty },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!stored)
+        await carol._test_drainAllPipelines()
+        #expect(carol.courierStore.isEmpty)
     }
 
     @Test func unsignedDepositIsRejected() async throws {
@@ -530,11 +510,8 @@ struct CourierEndToEndTests {
         )
 
         carol._test_handlePacket(packet, fromPeerID: alicePeerID, signingPublicKey: alice.getSigningPublicKeyData())
-        let stored = await TestHelpers.waitUntil(
-            { !carol.courierStore.isEmpty },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!stored)
+        await carol._test_drainAllPipelines()
+        #expect(carol.courierStore.isEmpty)
     }
 
     @Test func courierDepositTrustUsesIngressPeerNotClaimedSender() async throws {
@@ -573,11 +550,8 @@ struct CourierEndToEndTests {
         )
 
         carol._test_handlePacket(packet, fromPeerID: mallory.myPeerID, preseedPeer: false)
-        let stored = await TestHelpers.waitUntil(
-            { !carol.courierStore.isEmpty },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!stored)
+        await carol._test_drainAllPipelines()
+        #expect(carol.courierStore.isEmpty)
     }
 
     /// Regression for the relaunch amplification storm: redundant copies of
@@ -589,7 +563,7 @@ struct CourierEndToEndTests {
         let alice = makeService()
         let bob = makeService()
         let bobDelegate = NoiseCaptureDelegate()
-        bob.delegate = bobDelegate
+        bob.eventDelegate = bobDelegate
 
         let bobKey = bob.noiseStaticPublicKeyData()
         let first = try #require(alice.sealBridgeCourierEnvelope("once", messageID: "dup-1", recipientNoiseKey: bobKey))
@@ -605,13 +579,9 @@ struct CourierEndToEndTests {
             timeout: TestConstants.settleTimeout
         )
         #expect(delivered)
-        // Give a duplicate delivery a chance to surface, then confirm the
-        // second copy never reached the delegate.
-        let duplicated = await TestHelpers.waitUntil(
-            { bobDelegate.snapshot().count > 1 },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!duplicated)
+        // Drain queues + MainActor delivery hops to confirm the second copy
+        // never reached the delegate.
+        await bob._test_drainAllPipelines()
         #expect(bobDelegate.snapshot().count == 1)
     }
 
@@ -627,11 +597,8 @@ struct CourierEndToEndTests {
         // Nobody by this ID on the mesh (not connected, not reachable).
         ble.sendDeliveryAck(for: "msg-1", to: PeerID(str: "00000000000000ee"))
 
-        let initiated = await TestHelpers.waitUntil(
-            { outbound.count(ofType: .noiseHandshake) > 0 },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!initiated)
+        await ble._test_drainAllPipelines()
+        #expect(outbound.count(ofType: .noiseHandshake) == 0)
 
         // Control: a peer that is actually around still gets the handshake.
         let present = PeerID(str: "00000000000000ef")
@@ -670,7 +637,6 @@ struct CourierEndToEndTests {
 /// Minimal transport stub for exercising MessageRouter's courier deposit
 /// logic without BLE plumbing.
 private final class CourierCaptureTransport: Transport, MeshCourierTransporting {
-    weak var delegate: BitchatDelegate?
     weak var eventDelegate: TransportEventDelegate?
     weak var peerEventsDelegate: TransportPeerEventsDelegate?
 

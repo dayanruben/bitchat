@@ -33,8 +33,6 @@ protocol ChatVerificationContext: AnyObject {
     func setEncryptionStatus(_ status: EncryptionStatus?, for peerID: PeerID)
     func updateEncryptionStatus(for peerID: PeerID)
     func invalidateEncryptionCache(for peerID: PeerID?)
-    /// Signals that verification state changed so observers refresh (e.g. `objectWillChange.send()`).
-    func notifyUIChanged()
 
     // MARK: Peers
     var unifiedPeers: [BitchatPeer] { get }
@@ -141,7 +139,7 @@ extension ChatViewModel: ChatVerificationContext {
     }
 
     func postLocalNotification(title: String, body: String, identifier: String) {
-        NotificationService.shared.sendLocalNotification(title: title, body: body, identifier: identifier)
+        NotificationService.shared.sendVerificationNotification(title: title, body: body, identifier: identifier)
     }
 }
 
@@ -214,7 +212,6 @@ final class ChatVerificationCoordinator {
         }
 
         context.invalidateEncryptionCache(for: nil)
-        context.notifyUIChanged()
     }
 
     func setupNoiseCallbacks() {

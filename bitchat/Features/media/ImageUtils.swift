@@ -95,60 +95,27 @@ enum ImageUtils {
     private static func scaledImage(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
         let size = image.size
         let maxSide = max(size.width, size.height)
-        guard maxSide > maxDimension else { return image }
-        let scale = maxDimension / maxSide
-        let newSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let needsDownscale = maxSide > maxDimension
+        let needsOrientationNormalization = image.imageOrientation != .up
+        guard needsDownscale || needsOrientationNormalization else { return image }
 
-        // Draw into a new context to get a clean CGImage without metadata
-        UIGraphicsBeginImageContextWithOptions(newSize, true, 1.0)
-        image.draw(in: CGRect(origin: .zero, size: newSize))
-        let rendered = UIGraphicsGetImageFromCurrentImageContext()
-        UIGraphicsEndImageContext()
-        return rendered ?? image
-    }
-    #else
-    static func processImage(_ image: NSImage, maxDimension: CGFloat = 448, outputDirectory: URL? = nil) throws -> URL {
-        return try autoreleasepool {
-            let scaled = scaledImage(image, maxDimension: maxDimension)
-            guard let inputCG = scaled.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-                throw ImageUtilsError.encodingFailed
-            }
-            let width = inputCG.width
-            let height = inputCG.height
-            let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-            guard let context = CGContext(
-                data: nil,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: 0,
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            ) else {
-                throw ImageUtilsError.encodingFailed
-            }
-            context.draw(inputCG, in: CGRect(x: 0, y: 0, width: width, height: height))
-            guard let cgImage = context.makeImage() else {
-                throw ImageUtilsError.encodingFailed
-            }
-            return try encodeAndWriteJPEG(from: cgImage, outputDirectory: outputDirectory)
+        let newSize: CGSize
+        if needsDownscale {
+            let scale = maxDimension / maxSide
+            newSize = CGSize(width: size.width * scale, height: size.height * scale)
+        } else {
+            newSize = size
         }
-    }
 
-    private static func scaledImage(_ image: NSImage, maxDimension: CGFloat) -> NSImage {
-        let size = image.size
-        let maxSide = max(size.width, size.height)
-        guard maxSide > maxDimension else { return image }
-        let scale = maxDimension / maxSide
-        let newSize = NSSize(width: size.width * scale, height: size.height * scale)
-        let scaledImage = NSImage(size: newSize)
-        scaledImage.lockFocus()
-        image.draw(in: NSRect(origin: .zero, size: newSize),
-                   from: NSRect(origin: .zero, size: size),
-                   operation: .copy,
-                   fraction: 1.0)
-        scaledImage.unlockFocus()
-        return scaledImage
+        // Draw into a fresh renderer so EXIF orientation is baked into pixel
+        // data before taking `.cgImage` (which drops `imageOrientation`).
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: newSize, format: format)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: newSize))
+        }
     }
     #endif
 
@@ -169,7 +136,11 @@ enum ImageUtils {
         }
 
         let outputURL = try makeOutputURL(outputDirectory: outputDirectory)
+        #if os(iOS)
+        try jpegData.write(to: outputURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        #else
         try jpegData.write(to: outputURL, options: .atomic)
+        #endif
         return outputURL
     }
 

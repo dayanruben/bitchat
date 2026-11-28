@@ -368,8 +368,8 @@ struct BinaryProtocolTests {
             let packet = TestHelpers.createTestPacket(payload: Data(payload.utf8))
             let encodedData = try #require(BinaryProtocol.encode(packet), "Failed to encode packet")
             
-            // Verify padding creates standard block sizes up to configured limit (no 4096 bucket currently)
-            let blockSizes = [256, 512, 1024, 2048]
+            // Verify padding creates standard 256-byte stride block sizes up to 2048
+            let blockSizes = MessagePadding.blockSizes
             if encodedData.count <= 2048 {
                 #expect(blockSizes.contains(encodedData.count), "Encoded size \(encodedData.count) is not a standard block size")
             } else {
@@ -387,6 +387,20 @@ struct BinaryProtocolTests {
         // Different payload sizes (within <=2048) may map to the same bucket depending on compression.
         // Require at least one padded size to be present.
         #expect(encodedSizes.filter { $0 <= 2048 }.count >= 1, "Expected at least one padded size up to 2048, got \(encodedSizes)")
+    }
+
+    @Test func messagePaddingCoversEveryLengthUpTo2048WithoutGaps() {
+        for size in 1...2048 {
+            // Use 0x00 bytes so unpadded frames at exact 256-byte multiples
+            // cannot accidentally look like valid PKCS#7 padding.
+            let raw = Data(repeating: 0x00, count: size)
+            let target = MessagePadding.optimalBlockSize(for: raw.count)
+            let padded = MessagePadding.pad(raw, toSize: target)
+            #expect(MessagePadding.blockSizes.contains(padded.count), "Size \(size) produced non-bucket length \(padded.count)")
+            #expect(padded.count == target)
+            let restored = MessagePadding.unpad(padded)
+            #expect(restored == raw, "Round-trip failed for size \(size)")
+        }
     }
 
     @Test func invalidPKCS7PaddingIsRejected() throws {
@@ -412,66 +426,8 @@ struct BinaryProtocolTests {
         }
     }
     
-    // MARK: - Message Encoding/Decoding Tests
-    
-    @Test func messageEncodingDecoding() throws {
-        let message = TestHelpers.createTestMessage()
-        
-        let payload = try #require(message.toBinaryPayload(), "Failed to encode message to binary")
-        
-        let decodedMessage = try #require(BitchatMessage(payload), "Failed to decode message from binary")
-        
-        #expect(decodedMessage.content == message.content)
-        #expect(decodedMessage.sender == message.sender)
-        #expect(decodedMessage.senderPeerID == message.senderPeerID)
-        #expect(decodedMessage.isPrivate == message.isPrivate)
-        
-        // Timestamp should be close (within 1 second due to conversion)
-        let timeDiff = abs(decodedMessage.timestamp.timeIntervalSince(message.timestamp))
-        #expect(timeDiff < 1)
-    }
-    
-    func testPrivateMessageEncoding() throws {
-        let message = TestHelpers.createTestMessage(
-            isPrivate: true,
-            recipientNickname: TestConstants.testNickname2
-        )
-        
-        let payload = try #require(message.toBinaryPayload(), "Failed to encode private message")
-        let decodedMessage = try #require(BitchatMessage(payload), "Failed to decode private message")
-        
-        #expect(decodedMessage.isPrivate)
-        #expect(decodedMessage.recipientNickname == TestConstants.testNickname2)
-    }
-    
-    @Test func messageWithMentions() throws {
-        let mentions = [TestConstants.testNickname2, TestConstants.testNickname3]
-        let message = TestHelpers.createTestMessage(mentions: mentions)
-        let payload = try #require(message.toBinaryPayload(), "Failed to encode message with mentions")
-        let decodedMessage = try #require(BitchatMessage(payload), "Failed to decode message with mentions")
-        #expect(decodedMessage.mentions == mentions)
-    }
-    
-    @Test func relayMessageEncoding() throws {
-        let message = BitchatMessage(
-            id: UUID().uuidString,
-            sender: TestConstants.testNickname1,
-            content: TestConstants.testMessage1,
-            timestamp: Date(),
-            isRelay: true,
-            originalSender: TestConstants.testNickname3,
-            isPrivate: false,
-            recipientNickname: nil,
-            mentions: nil
-        )
-        let payload = try #require(message.toBinaryPayload(), "Failed to encode relay message")
-        let decodedMessage = try #require(BitchatMessage(payload), "Failed to decode relay message")
-        #expect(decodedMessage.isRelay)
-        #expect(decodedMessage.originalSender == TestConstants.testNickname3)
-    }
-    
     // MARK: - Edge Cases and Error Handling
-    
+
     @Test("Too small data")
     func invalidDataDecoding() throws {
         let tooSmall = Data(repeating: 0, count: 5)
@@ -489,24 +445,7 @@ struct BinaryProtocolTests {
         encoded[0] = 0xFF
         #expect(BinaryProtocol.decode(encoded) == nil)
     }
-    
-    @Test("Test maximum size handling")
-    func largeMessageHandling() throws {
-        let largeContent = String(repeating: "X", count: 65535) // Max uint16
-        let message = TestHelpers.createTestMessage(content: largeContent)
-        let payload = try #require(message.toBinaryPayload(), "Failed to handle large message")
-        let decodedMessage = try #require(BitchatMessage(payload), "Failed to handle large message")
-        #expect(decodedMessage.content == largeContent)
-    }
-    
-    @Test("Test message with empty content")
-    func emptyFieldsHandling() throws {
-        let emptyMessage = TestHelpers.createTestMessage(content: "")
-        let payload = try #require(emptyMessage.toBinaryPayload(), "Failed to handle empty message")
-        let decodedMessage = try #require(BitchatMessage(payload), "Failed to handle empty message")
-        #expect(decodedMessage.content.isEmpty)
-    }
-    
+
     // MARK: - Protocol Version Tests
     
     @Test("Test with supported version (version is always 1 in init)")

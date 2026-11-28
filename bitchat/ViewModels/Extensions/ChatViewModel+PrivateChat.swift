@@ -56,8 +56,8 @@ extension ChatViewModel {
     }
 
     @MainActor
-    func sendVoiceNote(at url: URL) {
-        mediaTransferCoordinator.sendVoiceNote(at: url)
+    func sendVoiceNote(at url: URL, target: VoiceNoteTarget? = nil) {
+        mediaTransferCoordinator.sendVoiceNote(at: url, target: target)
     }
 
     /// Where a live burst would stream right now, or nil when the hold would
@@ -69,7 +69,7 @@ extension ChatViewModel {
 
     @MainActor
     private func liveVoiceTarget() -> LiveVoiceTarget? {
-        guard PTTSettings.liveVoiceEnabled else { return nil }
+        guard liveVoiceCoordinator.liveVoiceEnabled() else { return nil }
 
         if let selectedPeer = selectedPrivateChatPeer {
             guard !selectedPeer.isGeoDM, !selectedPeer.isGeoChat, !selectedPeer.isGroup else { return nil }
@@ -110,7 +110,7 @@ extension ChatViewModel {
                 voiceTransport?.sendVoiceFrameBroadcast(packet)
             })
         case nil:
-            SecureLogger.info("PTT: hold uses classic voice note (liveVoiceEnabled=\(PTTSettings.liveVoiceEnabled), dmSelected=\(selectedPrivateChatPeer != nil))", category: .session)
+            SecureLogger.info("PTT: hold uses classic voice note (liveVoiceEnabled=\(liveVoiceCoordinator.liveVoiceEnabled()), dmSelected=\(selectedPrivateChatPeer != nil))", category: .session)
             return VoiceNoteCaptureSession()
         }
     }

@@ -28,7 +28,7 @@ struct BLEAnnounceHandlerEnvironment {
     /// Verifies the packet signature against the announced signing key.
     let verifySignature: (_ packet: BitchatPacket, _ signingPublicKey: Data) -> Bool
     /// Direct link state for the peer (BLE-queue read).
-    let linkState: (PeerID) -> (hasPeripheral: Bool, hasCentral: Bool)
+    let linkState: (PeerID) -> BLEDirectLinkState
     /// Whether the link this packet arrived on is already bound to a
     /// different peer ID (ingress-registry + BLE-queue read). Directness
     /// rides on the unsigned TTL, so a replayed announce can look "direct"
@@ -240,8 +240,20 @@ final class BLEAnnounceHandler {
             }
         }
 
+        // Unverified announces must stop completely before touching dedup, UI
+        // refresh, or reciprocal announce-back; otherwise spoofed announces
+        // with random sender IDs amplify broadcasts and churn the main thread.
+        guard verifiedAnnounce else {
+            return BLEAnnounceHandlingResult(
+                peerID: peerID,
+                announcement: announcement,
+                isDirectAnnounce: isDirectAnnounce,
+                isVerified: false
+            )
+        }
+
         // Update topology with verified neighbor claims (only for authenticated announces)
-        if verifiedAnnounce, let neighbors = announcement.directNeighbors {
+        if let neighbors = announcement.directNeighbors {
             env.updateTopology(peerID, neighbors)
         }
 
@@ -249,9 +261,7 @@ final class BLEAnnounceHandler {
         // verification — only for verified announces. Persisting unverified
         // announces would let an attacker who replays a victim's noisePublicKey
         // overwrite the victim's stored signing key/nickname (identity poisoning).
-        if verifiedAnnounce {
-            env.persistIdentity(announcement)
-        }
+        env.persistIdentity(announcement)
 
         let announceBackID = "announce-back-\(peerID)"
         let shouldSendBack = !env.dedupContains(announceBackID)
@@ -274,13 +284,8 @@ final class BLEAnnounceHandler {
         )
 
         // Track for sync — verified announces only (our own are tracked at
-        // send time). An unverified announce costs nothing to mint (any 32
-        // random bytes satisfy the sender binding), so tracking it would let
-        // a nearby device fill the announce store and the sync filter with
-        // junk identities that every peer then re-serves.
-        if verifiedAnnounce {
-            env.trackPacketSeen(packet)
-        }
+        // send time).
+        env.trackPacketSeen(packet)
 
         if responsePlan.shouldSendAnnounceBack {
             // Reciprocate announce for bidirectional discovery

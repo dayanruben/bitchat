@@ -24,52 +24,11 @@ protocol LocationStateGeocoding: AnyObject {
     )
 }
 
-private final class CLLocationManagerAdapter: NSObject, LocationStateManaging {
-    private let base = CLLocationManager()
-
-    var delegate: CLLocationManagerDelegate? {
-        get { base.delegate }
-        set { base.delegate = newValue }
-    }
-
-    var desiredAccuracy: CLLocationAccuracy {
-        get { base.desiredAccuracy }
-        set { base.desiredAccuracy = newValue }
-    }
-
-    var distanceFilter: CLLocationDistance {
-        get { base.distanceFilter }
-        set { base.distanceFilter = newValue }
-    }
-
-    var authorizationStatus: CLAuthorizationStatus {
-        base.authorizationStatus
-    }
-
-    func requestWhenInUseAuthorization() {
-        base.requestWhenInUseAuthorization()
-    }
-
-    func requestLocation() {
-        base.requestLocation()
-    }
-
-    func startUpdatingLocation() {
-        base.startUpdatingLocation()
-    }
-
-    func stopUpdatingLocation() {
-        base.stopUpdatingLocation()
-    }
-}
+extension CLLocationManager: LocationStateManaging {}
 
 private final class CLGeocoderAdapter: LocationStateGeocoding {
     private let base = CLGeocoder()
-
-    func cancelGeocode() {
-        base.cancelGeocode()
-    }
-
+    func cancelGeocode() { base.cancelGeocode() }
     func reverseGeocodeLocation(
         _ location: CLLocation,
         completionHandler: @escaping ([CLPlacemark]?, Error?) -> Void
@@ -101,7 +60,6 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
 
     private let cl: LocationStateManaging
     private let geocoder: LocationStateGeocoding
-    private var refreshTimer: Timer?
 
     // MARK: - Persistence Keys
 
@@ -132,26 +90,16 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
     private var resolvingNames: Set<String> = []
     private let storage: UserDefaults
 
-    /// Returns true if running in test environment
-    private static var isRunningTests: Bool {
-        let env = ProcessInfo.processInfo.environment
-        return NSClassFromString("XCTestCase") != nil ||
-               env["XCTestConfigurationFilePath"] != nil ||
-               env["XCTestBundlePath"] != nil ||
-               env["GITHUB_ACTIONS"] != nil ||
-               env["CI"] != nil
-    }
-
     // MARK: - Initialization
 
     private override init() {
         self.storage = .standard
-        self.cl = CLLocationManagerAdapter()
+        self.cl = CLLocationManager()
         self.geocoder = CLGeocoderAdapter()
         super.init()
 
         // Skip CoreLocation setup in test environments
-        guard !Self.isRunningTests else {
+        guard !TestEnvironment.isRunningTests else {
             loadPersistedState()
             return
         }
@@ -167,7 +115,7 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
     /// Internal initializer for testing with custom storage
     init(storage: UserDefaults) {
         self.storage = storage
-        self.cl = CLLocationManagerAdapter()
+        self.cl = CLLocationManager()
         self.geocoder = CLGeocoderAdapter()
         super.init()
         loadPersistedState()
@@ -288,10 +236,8 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
         }
     }
 
-    func beginLiveRefresh(interval _: TimeInterval = TransportConfig.locationLiveRefreshInterval) {
+    func beginLiveRefresh() {
         guard permissionState == .authorized else { return }
-        refreshTimer?.invalidate()
-        refreshTimer = nil
         cl.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
         cl.distanceFilter = TransportConfig.locationDistanceFilterLiveMeters
         cl.startUpdatingLocation()
@@ -299,8 +245,6 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
     }
 
     func endLiveRefresh() {
-        refreshTimer?.invalidate()
-        refreshTimer = nil
         cl.stopUpdatingLocation()
         cl.desiredAccuracy = kCLLocationAccuracyHundredMeters
         cl.distanceFilter = TransportConfig.locationDistanceFilterMeters
@@ -404,7 +348,10 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard let loc = locations.last else { return }
+        // A fix CoreLocation queued before a revocation can still arrive
+        // after it. It must not refill the channels the revocation cleared,
+        // nor go out for geocoding.
+        guard isAuthorizedNow, let loc = locations.last else { return }
         computeChannels(from: loc.coordinate)
         reverseGeocodeLocation(loc)
     }
@@ -414,6 +361,15 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
     }
 
     // MARK: - Private Helpers (Permission)
+
+    /// CoreLocation's current answer. `permissionState` trails it by a
+    /// main-actor hop, so a callback that arrives in between checks this.
+    private var isAuthorizedNow: Bool {
+        switch cl.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse, .authorized: return true
+        default: return false
+        }
+    }
 
     @discardableResult
     private func updatePermissionState(from status: CLAuthorizationStatus) -> PermissionState {
@@ -432,7 +388,19 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
         if newState != .authorized {
             endLiveRefresh()
         }
-        Task { @MainActor in self.permissionState = newState }
+        Task { @MainActor in
+            // Fail closed: the last fix says where this device was, and
+            // presence, the bridge and the channel list all read it. Forget
+            // it here rather than rely on every reader checking permission,
+            // and before the new state publishes so no observer sees the
+            // revocation beside stale cells. Bookmarks and teleports are
+            // explicit choices and stay.
+            if newState != .authorized {
+                if !self.availableChannels.isEmpty { self.availableChannels = [] }
+                if !self.locationNames.isEmpty { self.locationNames = [:] }
+            }
+            self.permissionState = newState
+        }
         return newState
     }
 
@@ -473,7 +441,13 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
             guard let self = self else { return }
             if let pm = placemarks?.first {
                 let names = self.locationNamesByLevel(from: pm)
-                Task { @MainActor in self.locationNames = names }
+                Task { @MainActor in
+                    // The lookup can outlast a revocation that cleared the
+                    // names. Main-actor tasks run in order, so this sees the
+                    // published state of any revocation that came first.
+                    guard self.permissionState == .authorized else { return }
+                    self.locationNames = names
+                }
             }
         }
     }
@@ -655,13 +629,4 @@ final class LocationStateManager: NSObject, CLLocationManagerDelegate, Observabl
 
 typealias LocationChannelManager = LocationStateManager
 typealias GeohashBookmarksStore = LocationStateManager
-
-// MARK: - Backward Compatibility Extensions
-
-extension LocationStateManager {
-    /// Backward compatibility: toggle bookmark (was GeohashBookmarksStore.toggle)
-    func toggle(_ geohash: String) {
-        toggleBookmark(geohash)
-    }
-}
 #endif

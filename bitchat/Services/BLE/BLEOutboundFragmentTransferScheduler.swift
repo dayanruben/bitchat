@@ -39,21 +39,6 @@ struct BLEOutboundFragmentTransferRequest {
     }
 }
 
-/// Transactional admission for strict fragment trains. Durable callers may
-/// commit only when every fragment was accepted; the first rejection stops
-/// the train and reports failure so the original remains retryable.
-enum BLEStrictFragmentAdmission {
-    static func admitAll<Fragment>(
-        _ fragments: [Fragment],
-        accepting: (Fragment) -> Bool
-    ) -> Bool {
-        for fragment in fragments where !accepting(fragment) {
-            return false
-        }
-        return true
-    }
-}
-
 struct BLEOutboundFragmentTransferScheduler {
     enum QueuePosition {
         case front
@@ -93,6 +78,7 @@ struct BLEOutboundFragmentTransferScheduler {
         var workItems: [DispatchWorkItem]
         var contentKey: String?
         var directedPeer: PeerID?
+        var scanPauseToken: UUID? = nil
     }
 
     private var activeTransfers: [String: ActiveTransferState] = [:]
@@ -178,14 +164,20 @@ struct BLEOutboundFragmentTransferScheduler {
     mutating func activateReservedTransfer(
         id transferId: String,
         totalFragments: Int,
-        workItems: [DispatchWorkItem]
+        workItems: [DispatchWorkItem],
+        scanPauseToken: UUID? = nil
     ) -> Bool {
         guard var state = activeTransfers[transferId] else { return false }
         state.totalFragments = totalFragments
         state.sentFragments = 0
         state.workItems = workItems
+        state.scanPauseToken = scanPauseToken
         activeTransfers[transferId] = state
         return true
+    }
+
+    func scanPauseToken(for transferId: String) -> UUID? {
+        activeTransfers[transferId]?.scanPauseToken
     }
 
     mutating func updateWorkItems(_ workItems: [DispatchWorkItem], for transferId: String) -> Bool {

@@ -61,7 +61,6 @@ private final class MockChatMediaTransferContext: ChatMediaTransferContext {
     private(set) var untombstonedMediaRemovals: [String] = []
     private(set) var outgoingMediaRemovals: [String] = []
     private(set) var systemMessages: [String] = []
-    private(set) var notifyUIChangedCount = 0
 
     @discardableResult
     func appendPublicMessage(_ message: BitchatMessage, to conversationID: ConversationID) -> Bool {
@@ -88,7 +87,6 @@ private final class MockChatMediaTransferContext: ChatMediaTransferContext {
     func notifyMediaDeletionRefused(messageID: String) {
         mediaDeletionRefusals.append(messageID)
     }
-    func notifyUIChanged() { notifyUIChangedCount += 1 }
 
     // Delivery status & dedup
     private(set) var deliveryStatusUpdates: [(messageID: String, status: DeliveryStatus)] = []
@@ -384,7 +382,6 @@ struct ChatMediaTransferCoordinatorContextTests {
         #expect(message.senderPeerID == context.myPeerID)
         #expect(message.deliveryStatus == .sending)
         #expect(context.recordedContentKeys == ["[voice] note.m4a"])
-        #expect(context.notifyUIChangedCount == 1)
         #expect(context.appendedPublicMessages.isEmpty)
     }
 
@@ -400,7 +397,6 @@ struct ChatMediaTransferCoordinatorContextTests {
         #expect(!message.isPrivate)
         #expect(message.sender == "me")
         #expect(context.privateChats.isEmpty)
-        #expect(context.notifyUIChangedCount == 1)
     }
 
     @Test @MainActor
@@ -740,7 +736,7 @@ struct ChatMediaTransferCoordinatorContextTests {
             recipientNickname: "Me"
         )
 
-        coordinator.cleanupIncomingLocalFile(forMessage: message)
+        coordinator.cleanupLocalFile(forMessage: message)
 
         #expect(FileManager.default.fileExists(atPath: directory.path))
         #expect(FileManager.default.fileExists(atPath: child.path))
@@ -1692,6 +1688,41 @@ struct ChatMediaTransferCoordinatorContextTests {
             if case .failed = $0.status { return true }
             return false
         })
+    }
+
+    @Test @MainActor
+    func sendVoiceNoteWithCapturedPrivateTargetNeverBroadcastsAfterLeavingDM() async throws {
+        let context = MockChatMediaTransferContext()
+        let alice = PeerID(str: "a1b2c3d4e5f60708")
+        // User left Alice's DM before finalize completed: active selection is now
+        // public #mesh (selectedPrivateChatPeer == nil).
+        context.selectedPrivateChatPeer = nil
+        context.canSendMediaInCurrentContext = true
+        context.privateMediaPolicy = .encrypted
+
+        let coordinator = ChatMediaTransferCoordinator(
+            context: context,
+            prepareVoiceNotePacket: { url in
+                BitchatFilePacket(
+                    fileName: url.lastPathComponent,
+                    fileSize: 5,
+                    mimeType: "audio/mp4",
+                    content: Data("voice".utf8)
+                )
+            }
+        )
+        let url = try makeCoordinatorVoiceURL(fileName: "private-note.m4a")
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        coordinator.sendVoiceNote(at: url, target: .privateChat(alice))
+
+        #expect(await TestHelpers.waitUntil(
+            { context.privateFileSends.count == 1 },
+            timeout: TestConstants.longTimeout
+        ))
+        #expect(context.privateFileSends.first?.peerID == alice)
+        #expect(context.broadcastFileSends.isEmpty)
+        #expect(context.appendedPublicMessages.isEmpty)
     }
 }
 

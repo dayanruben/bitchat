@@ -18,7 +18,7 @@ struct MyQRView: View {
     private var boxColor: Color { palette.secondary.opacity(0.1) }
 
     private enum Strings {
-        static let title: LocalizedStringKey = "verification.my_qr.title"
+        static let title = String(localized: "verification.my_qr.title")
         static let accessibilityLabel = String(localized: "verification.my_qr.accessibility_label", comment: "Accessibility label describing the verification QR code")
     }
 
@@ -60,13 +60,15 @@ struct QRCodeImage: View {
     private let filter = CIFilter.qrCodeGenerator()
 
     private enum Strings {
-        static let unavailable: LocalizedStringKey = "verification.my_qr.unavailable"
+        static let unavailable = String(localized: "verification.my_qr.unavailable")
     }
 
     var body: some View {
         Group {
             if let image = generateImage() {
-                ImageWrapper(image: image)
+                Image(decorative: image, scale: 1.0)
+                    .interpolation(.none)
+                    .resizable()
                     .frame(width: size, height: size)
             } else {
                 RoundedRectangle(cornerRadius: 8)
@@ -92,24 +94,6 @@ struct QRCodeImage: View {
     }
 }
 
-// Platform-specific wrapper to display CGImage in SwiftUI
-struct ImageWrapper: View {
-    let image: CGImage
-    var body: some View {
-        #if os(iOS)
-        let ui = UIImage(cgImage: image)
-        return Image(uiImage: ui)
-            .interpolation(.none)
-            .resizable()
-        #else
-        let ns = NSImage(cgImage: image, size: .zero)
-        return Image(nsImage: ns)
-            .interpolation(.none)
-            .resizable()
-        #endif
-    }
-}
-
 /// Peer verification QR scanner. Uses the camera on iOS and macOS; macOS also
 /// keeps a paste/validate fallback for machines without a usable camera.
 struct QRScanView: View {
@@ -124,8 +108,8 @@ struct QRScanView: View {
     @State private var cameraUnavailable = false
 
     private enum Strings {
-        static let pastePrompt: LocalizedStringKey = "verification.scan.paste_prompt"
-        static let validate: LocalizedStringKey = "verification.scan.validate"
+        static let pastePrompt = String(localized: "verification.scan.paste_prompt")
+        static let validate = String(localized: "verification.scan.validate")
         static let cameraUnavailable = String(
             localized: "verification.scan.camera_unavailable",
             defaultValue: "Camera unavailable — paste a QR below.",
@@ -415,7 +399,7 @@ struct VerificationSheetView: View {
         VStack(spacing: 0) {
             // Top header (always at top)
             HStack {
-                Text("verification.sheet.title")
+                Text(String(localized: "verification.sheet.title"))
                     .bitchatFont(size: 14, weight: .bold)
                     .foregroundColor(accentColor)
                 Spacer()
@@ -435,7 +419,7 @@ struct VerificationSheetView: View {
             Group {
                 if showingScanner {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("verification.scan.prompt_friend")
+                        Text(String(localized: "verification.scan.prompt_friend"))
                             .bitchatFont(size: 16, weight: .bold)
                             .frame(maxWidth: .infinity)
                             .multilineTextAlignment(.center)

@@ -105,6 +105,7 @@ extension BLEService: CBCentralManagerDelegate {
             // not issue stop/cancel commands now; they are rejected as API
             // misuse. Retire our link state locally instead.
             SecureLogger.info("📴 Bluetooth powered off - cleaning up central state", category: .session)
+            radio.cancelFragmentScanPauses()
             let peripheralIDs = linkStateStore.peripheralStates.map { $0.peripheral.identifier.uuidString }
             for peripheralID in peripheralIDs {
                 pendingPeripheralWrites.discardAll(for: peripheralID)
@@ -115,6 +116,7 @@ extension BLEService: CBCentralManagerDelegate {
         case .unauthorized:
             // User denied Bluetooth permission
             SecureLogger.warning("🚫 Bluetooth unauthorized - user denied permission", category: .session)
+            radio.cancelFragmentScanPauses()
             linkStateStore.clearPeripherals()
             emitLinkEvent(.allPeripheralLinksEnded(peripheralIDs: [], retireProofsAndNotify: false))
 
@@ -125,6 +127,7 @@ extension BLEService: CBCentralManagerDelegate {
         case .resetting:
             // Bluetooth stack is resetting - will get another state update when done
             SecureLogger.info("🔄 Bluetooth stack resetting...", category: .session)
+            radio.cancelFragmentScanPauses()
 
         case .unknown:
             // Initial state before we know the actual state
@@ -273,16 +276,7 @@ extension BLEService: CBPeripheralDelegate {
         }
         
         // Found characteristic
-        
-        // Log characteristic properties for debugging
-        var properties: [String] = []
-        if characteristic.properties.contains(.read) { properties.append("read") }
-        if characteristic.properties.contains(.write) { properties.append("write") }
-        if characteristic.properties.contains(.writeWithoutResponse) { properties.append("writeWithoutResponse") }
-        if characteristic.properties.contains(.notify) { properties.append("notify") }
-        if characteristic.properties.contains(.indicate) { properties.append("indicate") }
-        // Characteristic properties: \(properties.joined(separator: ", "))
-        
+
         // Verify characteristic supports reliable writes
         if !characteristic.properties.contains(.write) {
             SecureLogger.warning("⚠️ Characteristic doesn't support reliable writes (withResponse)!", category: .session)

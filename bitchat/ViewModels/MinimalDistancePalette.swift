@@ -19,34 +19,8 @@ final class MinimalDistancePalette {
         let baseBrightnessDark: Double
         let ringBrightnessDeltaLight: Double
         let ringBrightnessDeltaDark: Double
-        let preferredBiasWeight: Double
-        let goldenStep: Int
-
-        init(
-            slotCount: Int,
-            avoidCenterHue: Double,
-            avoidHueDelta: Double,
-            saturationLight: Double,
-            saturationDark: Double,
-            baseBrightnessLight: Double,
-            baseBrightnessDark: Double,
-            ringBrightnessDeltaLight: Double,
-            ringBrightnessDeltaDark: Double,
-            preferredBiasWeight: Double = 0.05,
-            goldenStep: Int = 7
-        ) {
-            self.slotCount = slotCount
-            self.avoidCenterHue = avoidCenterHue
-            self.avoidHueDelta = avoidHueDelta
-            self.saturationLight = saturationLight
-            self.saturationDark = saturationDark
-            self.baseBrightnessLight = baseBrightnessLight
-            self.baseBrightnessDark = baseBrightnessDark
-            self.ringBrightnessDeltaLight = ringBrightnessDeltaLight
-            self.ringBrightnessDeltaDark = ringBrightnessDeltaDark
-            self.preferredBiasWeight = preferredBiasWeight
-            self.goldenStep = goldenStep
-        }
+        let preferredBiasWeight: Double = 0.05
+        let goldenStep: Int = 7
     }
 
     private struct Entry {
@@ -65,6 +39,13 @@ final class MinimalDistancePalette {
     }
 
     @MainActor
+    func reset() {
+        currentSeeds.removeAll(keepingCapacity: false)
+        entries.removeAll(keepingCapacity: false)
+        previousEntries.removeAll(keepingCapacity: false)
+    }
+
+    @MainActor
     func ensurePalette(for seeds: [String: String]) {
         guard seeds != currentSeeds || entries.count != seeds.count else { return }
         previousEntries = entries
@@ -75,10 +56,20 @@ final class MinimalDistancePalette {
     @MainActor
     func color(for identifier: String, isDark: Bool) -> Color? {
         guard let entry = entries[identifier] else { return nil }
-        let saturation = isDark ? config.saturationDark : config.saturationLight
+        var saturation = isDark ? config.saturationDark : config.saturationLight
         let baseBrightness = isDark ? config.baseBrightnessDark : config.baseBrightnessLight
         let ringDelta = isDark ? config.ringBrightnessDeltaDark : config.ringBrightnessDeltaLight
-        let brightness = min(1.0, max(0.0, baseBrightness + ringDelta * Double(entry.ring)))
+        var brightness = min(1.0, max(0.0, baseBrightness + ringDelta * Double(entry.ring)))
+        if isDark {
+            let adjusted = PeerColorContrast.adjustForDarkMode(
+                hue: entry.hue,
+                saturation: saturation,
+                brightness: brightness,
+                ring: entry.ring
+            )
+            saturation = adjusted.saturation
+            brightness = adjusted.brightness
+        }
         return Color(hue: entry.hue, saturation: saturation, brightness: brightness)
     }
 
@@ -189,15 +180,5 @@ extension MinimalDistancePalette.Config {
         ringBrightnessDeltaDark: TransportConfig.uiPeerPaletteRingBrightnessDeltaDark
     )
 
-    static let nostr = MinimalDistancePalette.Config(
-        slotCount: TransportConfig.uiPeerPaletteSlots,
-        avoidCenterHue: 30.0 / 360.0,
-        avoidHueDelta: TransportConfig.uiColorHueAvoidanceDelta,
-        saturationLight: 0.70,
-        saturationDark: 0.80,
-        baseBrightnessLight: 0.45,
-        baseBrightnessDark: 0.75,
-        ringBrightnessDeltaLight: TransportConfig.uiPeerPaletteRingBrightnessDeltaLight,
-        ringBrightnessDeltaDark: TransportConfig.uiPeerPaletteRingBrightnessDeltaDark
-    )
+    static let nostr = mesh
 }

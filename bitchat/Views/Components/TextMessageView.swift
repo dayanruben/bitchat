@@ -9,13 +9,14 @@
 import SwiftUI
 import BitFoundation
 
-struct TextMessageView: View {
+struct TextMessageView: View, Equatable {
     @Environment(\.colorScheme) private var colorScheme: ColorScheme
     @Environment(\.appTheme) private var theme
     @ThemedPalette private var palette
     @EnvironmentObject private var conversationUIModel: ConversationUIModel
 
     let message: BitchatMessage
+    private let messageIdentity: ObjectIdentifier
     /// Value snapshot of the message's mutable delivery status, captured at
     /// construction. `BitchatMessage` is a reference type mutated in place by
     /// `ConversationStore`, and SwiftUI compares reference-typed view fields
@@ -29,90 +30,50 @@ struct TextMessageView: View {
 
     init(message: BitchatMessage) {
         self.message = message
+        self.messageIdentity = ObjectIdentifier(message)
         self.deliveryStatus = message.deliveryStatus
+    }
+
+    nonisolated static func == (lhs: TextMessageView, rhs: TextMessageView) -> Bool {
+        lhs.messageIdentity == rhs.messageIdentity && lhs.deliveryStatus == rhs.deliveryStatus
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Heavy token scans run once per message, not once per render
             let scan = message.contentScan
+            let showsDeliveryStatus = message.isPrivate
+                && conversationUIModel.isSentByCurrentUser(message)
+                && deliveryStatus != .notSentYet
             // Baseline alignment keeps the lock and delivery glyphs on the
             // first text line; a fixed top padding left the lock's solid body
             // hanging below the line's visual center.
             HStack(alignment: .firstTextBaseline, spacing: 0) {
                 let isExpanded = expandedMessageIDs.contains(message.id)
-                if message.isPrivate {
-                    Image(systemName: "lock.fill")
-                        .font(.bitchatSystem(size: 8))
-                        .foregroundColor(Color.orange.opacity(0.75))
-                        .padding(.trailing, 4)
-                        .accessibilityHidden(true)
-                }
-                if conversationUIModel.showsVerifiedSeal(for: message) {
-                    Image(systemName: "checkmark.seal.fill")
-                        .font(.bitchatSystem(size: 8))
-                        .foregroundColor(Color.green.opacity(0.85))
-                        .padding(.trailing, 4)
-                        .accessibilityLabel(
-                            String(localized: "content.accessibility.verified_sender", defaultValue: "Verified sender", comment: "Accessibility label for the seal next to a verified peer's name on a private message")
-                        )
-                }
-                if message.isBridged {
-                    Image(systemName: "network")
-                        .font(.bitchatSystem(size: 8))
-                        .foregroundColor(Color.cyan.opacity(0.75))
-                        .padding(.trailing, 4)
-                        .accessibilityLabel(
-                            String(localized: "content.accessibility.bridged_message", defaultValue: "Arrived across a mesh bridge", comment: "Accessibility label for the glyph marking a message that arrived across a mesh bridge")
-                        )
-                }
+                MessageLeadingBadges(
+                    isPrivate: message.isPrivate,
+                    showsVerifiedSeal: conversationUIModel.showsVerifiedSeal(for: message),
+                    isBridged: message.isBridged
+                )
                 Text(conversationUIModel.formatMessage(message, colorScheme: colorScheme, theme: theme))
                     .fixedSize(horizontal: false, vertical: true)
                     .lineLimit(scan.isLongForDisplay && !isExpanded ? TransportConfig.uiLongMessageLineLimit : nil)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 
-                // Delivery status indicator for private messages. Tappable:
-                // .help() tooltips only exist on macOS, so iOS users get the
-                // explanation as a caption under the row instead.
-                if message.isPrivate && conversationUIModel.isSentByCurrentUser(message),
-                   deliveryStatus != .notSentYet {
-                    Button {
-                        showDeliveryDetail.toggle()
-                    } label: {
-                        DeliveryStatusView(status: deliveryStatus)
-                            .padding(.leading, 4)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityHint(
-                        String(localized: "content.accessibility.delivery_detail_hint", comment: "Accessibility hint for the delivery status glyph explaining a tap reveals details")
-                    )
+                if showsDeliveryStatus {
+                    MessageDeliveryStatusButton(status: deliveryStatus, showDetail: $showDeliveryDetail)
                 }
             }
 
-            // Failure reasons stay visible without a tap; other statuses
-            // reveal on demand.
-            if message.isPrivate && conversationUIModel.isSentByCurrentUser(message),
-               deliveryStatus != .notSentYet {
-                if case .failed = deliveryStatus {
-                    Text(verbatim: deliveryStatus.bitchatDescription)
-                        .bitchatFont(size: 11)
-                        .foregroundColor(Color.red.opacity(0.9))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, 2)
-                } else if showDeliveryDetail {
-                    Text(verbatim: deliveryStatus.bitchatDescription)
-                        .bitchatFont(size: 11)
-                        .foregroundColor(palette.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, 2)
-                }
+            if showsDeliveryStatus {
+                MessageDeliveryDetailCaption(status: deliveryStatus, showDetail: showDeliveryDetail)
+                    .padding(.top, 2)
             }
             
             // Expand/Collapse for very long messages
             if scan.isLongForDisplay {
                 let isExpanded = expandedMessageIDs.contains(message.id)
-                let labelKey = isExpanded ? LocalizedStringKey("content.message.show_less") : LocalizedStringKey("content.message.show_more")
+                let labelKey = isExpanded ? String(localized: "content.message.show_less") : String(localized: "content.message.show_more")
                 Button(labelKey) {
                     if isExpanded { expandedMessageIDs.remove(message.id) }
                     else { expandedMessageIDs.insert(message.id) }

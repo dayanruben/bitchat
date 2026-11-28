@@ -34,11 +34,15 @@ struct PrekeyEndToEndTests {
         }
     }
 
-    private final class NoiseCaptureDelegate: BitchatDelegate {
+    private final class NoiseCaptureDelegate: TransportEventDelegate {
         private let lock = NSLock()
         private var payloads: [(peerID: PeerID, type: NoisePayloadType, payload: Data)] = []
 
-        func didReceiveNoisePayload(from peerID: PeerID, type: NoisePayloadType, payload: Data, timestamp: Date) {
+        @MainActor
+        func didReceiveTransportEvent(_ event: TransportEvent) {
+            guard case let .noisePayloadReceived(peerID, type, payload, _) = event else {
+                return
+            }
             lock.lock(); payloads.append((peerID, type, payload)); lock.unlock()
         }
 
@@ -46,27 +50,27 @@ struct PrekeyEndToEndTests {
             lock.lock(); defer { lock.unlock() }
             return payloads
         }
-
-        // Unused BitchatDelegate requirements.
-        func didReceiveMessage(_ message: BitchatMessage) {}
-        func didConnectToPeer(_ peerID: PeerID) {}
-        func didDisconnectFromPeer(_ peerID: PeerID) {}
-        func didUpdatePeerList(_ peers: [PeerID]) {}
-        func didUpdateBluetoothState(_ state: CBManagerState) {}
-        func didReceivePublicMessage(from peerID: PeerID, nickname: String, content: String, timestamp: Date, messageID: String?) {}
     }
 
-    private func makeService() -> BLEService {
+    private func makeService() -> (service: BLEService, identityManager: MockIdentityManager) {
         let keychain = MockKeychain()
+        let identityManager = MockIdentityManager(keychain)
         let service = BLEService(
             keychain: keychain,
             idBridge: NostrIdentityBridge(keychain: MockKeychainHelper()),
-            identityManager: MockIdentityManager(keychain),
+            identityManager: identityManager,
             initializeBluetoothManagers: false
         )
         service.courierStore = CourierStore(persistsToDisk: false)
         service.prekeyBundleStore = PrekeyBundleStore(persistsToDisk: false)
-        return service
+        return (service, identityManager)
+    }
+
+    private func authenticateSigningKey(of peer: BLEService, in identityManager: MockIdentityManager) {
+        identityManager.bindAuthenticatedSigningPublicKey(
+            peer.noiseSigningPublicKeyData(),
+            fingerprint: peer.noiseStaticPublicKeyData().sha256Fingerprint()
+        )
     }
 
     private func preseedConnectedPeer(_ peer: BLEService, in service: BLEService) {
@@ -99,13 +103,13 @@ struct PrekeyEndToEndTests {
     // MARK: - Tests
 
     @Test func prekeySealedMailTravelsViaCourierAndOpens() async throws {
-        let alice = makeService()
-        let carol = makeService()
-        let bob = makeService()
+        let (alice, aliceIdentity) = makeService()
+        let (carol, _) = makeService()
+        let (bob, _) = makeService()
         carol.courierDepositPolicy = { _, _ in .favorite }
 
         let bobDelegate = NoiseCaptureDelegate()
-        bob.delegate = bobDelegate
+        bob.eventDelegate = bobDelegate
 
         let aliceOut = PacketTap()
         alice._test_onOutboundPacket = aliceOut.record
@@ -116,8 +120,9 @@ struct PrekeyEndToEndTests {
 
         preseedConnectedPeer(carol, in: alice)
 
-        // 1. While Bob is still around, Alice hears his verified announce
-        //    (binding his signing key) and his gossiped prekey bundle.
+        // 1. While Bob is still around, Alice has bound his signing key through
+        //    an authenticated Noise session and hears his announce + prekey bundle.
+        authenticateSigningKey(of: bob, in: aliceIdentity)
         let (announce, bundlePacket) = try await captureAnnounceAndBundle(from: bob, tap: bobOut)
         alice._test_handlePacket(announce, fromPeerID: bob.myPeerID, preseedPeer: false)
         alice._test_handlePacket(bundlePacket, fromPeerID: bob.myPeerID, preseedPeer: false)
@@ -205,20 +210,16 @@ struct PrekeyEndToEndTests {
             ttl: 1
         )
         bob._test_handlePacket(redelivery, fromPeerID: carol.myPeerID)
-        let redelivered = await TestHelpers.waitUntil(
-            { bobDelegate.snapshot().count == 2 },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!redelivered)
+        await bob._test_drainAllPipelines()
         #expect(bobDelegate.snapshot().count == 1)
     }
 
     @Test func withoutBundleSealingFallsBackToStatic() async throws {
-        let alice = makeService()
-        let bob = makeService()
+        let (alice, _) = makeService()
+        let (bob, _) = makeService()
 
         let bobDelegate = NoiseCaptureDelegate()
-        bob.delegate = bobDelegate
+        bob.eventDelegate = bobDelegate
         let aliceOut = PacketTap()
         alice._test_onOutboundPacket = aliceOut.record
 
@@ -258,28 +259,107 @@ struct PrekeyEndToEndTests {
     }
 
     @Test func unverifiableBundleIsIgnored() async throws {
-        let alice = makeService()
-        let bob = makeService()
+        let (alice, _) = makeService()
+        let (bob, _) = makeService()
 
         let bobOut = PacketTap()
         bob._test_onOutboundPacket = bobOut.record
 
-        // Alice receives Bob's bundle but never saw a verified announce, so
-        // no signing key is bound to his noise key: the bundle must not be
-        // cached or enter Alice's gossip store.
+        // Alice receives Bob's bundle but never authenticated his signing key
+        // via Noise: the bundle must not be cached or enter Alice's gossip store.
         let (_, bundlePacket) = try await captureAnnounceAndBundle(from: bob, tap: bobOut)
         alice._test_handlePacket(bundlePacket, fromPeerID: bob.myPeerID, preseedPeer: false)
 
-        let cached = await TestHelpers.waitUntil(
-            { alice.prekeyBundleStore.hasUsableBundle(for: bob.noiseStaticPublicKeyData()) },
-            timeout: TestConstants.negativeWaitWindow
+        await alice._test_drainAllPipelines()
+        #expect(!alice.prekeyBundleStore.hasUsableBundle(for: bob.noiseStaticPublicKeyData()))
+    }
+
+    @Test func tofuOnlyForgedAnnounceAndPrekeyBundleCannotInterceptCourierMail() async throws {
+        let (alice, _) = makeService()
+        let (carol, _) = makeService()
+        let (bob, _) = makeService()
+        let malloryNoise = NoiseEncryptionService(keychain: MockKeychain())
+
+        let aliceOut = PacketTap()
+        alice._test_onOutboundPacket = aliceOut.record
+        preseedConnectedPeer(carol, in: alice)
+
+        // Mallory has Bob's public Noise key (from a public announce or QR)
+        // and self-asserts an announce pairing Bob's Noise key with Mallory's
+        // Ed25519 signing key, followed by a prekey bundle signed by Mallory.
+        let bobNoiseKey = bob.noiseStaticPublicKeyData()
+        let bobPeerID = PeerID(publicKey: bobNoiseKey)
+        let fakeAnnounce = AnnouncementPacket(
+            nickname: "bob",
+            noisePublicKey: bobNoiseKey,
+            signingPublicKey: malloryNoise.getSigningPublicKeyData(),
+            directNeighbors: nil,
+            capabilities: [.prekeys]
         )
-        #expect(!cached)
+        let fakeAnnounceUnsigned = BitchatPacket(
+            type: MessageType.announce.rawValue,
+            senderID: Data(hexString: bobPeerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: try #require(fakeAnnounce.encode()),
+            signature: nil,
+            ttl: 7
+        )
+        let fakeAnnouncePacket = try #require(malloryNoise.signPacket(fakeAnnounceUnsigned))
+
+        let malloryPrekeyBundle = try #require(malloryNoise.currentPrekeyBundle())
+        let forgedUnsigned = PrekeyBundle(
+            noiseStaticPublicKey: bobNoiseKey,
+            prekeys: malloryPrekeyBundle.prekeys,
+            generatedAt: malloryPrekeyBundle.generatedAt,
+            signature: Data(count: PrekeyBundle.signatureLength)
+        )
+        let forgedBundle = PrekeyBundle(
+            noiseStaticPublicKey: forgedUnsigned.noiseStaticPublicKey,
+            prekeys: forgedUnsigned.prekeys,
+            generatedAt: forgedUnsigned.generatedAt,
+            signature: try #require(malloryNoise.signData(forgedUnsigned.signableBytes()))
+        )
+        let forgedBundleUnsignedPacket = BitchatPacket(
+            type: MessageType.prekeyBundle.rawValue,
+            senderID: Data(hexString: bobPeerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: try #require(forgedBundle.encode()),
+            signature: nil,
+            ttl: 7
+        )
+        let forgedBundlePacket = try #require(malloryNoise.signPacket(forgedBundleUnsignedPacket))
+
+        alice._test_handlePacket(fakeAnnouncePacket, fromPeerID: bobPeerID, preseedPeer: false)
+        alice._test_handlePacket(forgedBundlePacket, fromPeerID: bobPeerID, preseedPeer: false)
+
+        await alice._test_drainAllPipelines()
+        #expect(!alice.prekeyBundleStore.hasUsableBundle(for: bobNoiseKey))
+        #expect(!alice._test_hasGossipPrekeyBundle(for: bobPeerID))
+
+        // Alice seals courier mail for Bob: must fall back to static-key
+        // sealing (v1, prekeyID == nil) so Mallory cannot decrypt it.
+        #expect(alice.sendCourierMessage(
+            "secret for bob",
+            messageID: "forged-prekey-regression",
+            recipientNoiseKey: bobNoiseKey,
+            via: [carol.myPeerID]
+        ))
+        let deposited = await TestHelpers.waitUntil(
+            { aliceOut.first(ofType: .courierEnvelope) != nil },
+            timeout: TestConstants.settleTimeout
+        )
+        #expect(deposited)
+        let depositPacket = try #require(aliceOut.first(ofType: .courierEnvelope))
+        let envelope = try #require(CourierEnvelope.decode(depositPacket.payload))
+        #expect(envelope.prekeyID == nil)
     }
 
     @Test func forgedBundleSignatureIsRejected() async throws {
-        let alice = makeService()
-        let bob = makeService()
+        let (alice, aliceIdentity) = makeService()
+        let (bob, _) = makeService()
+        authenticateSigningKey(of: bob, in: aliceIdentity)
 
         let bobOut = PacketTap()
         bob._test_onOutboundPacket = bobOut.record
@@ -308,16 +388,14 @@ struct PrekeyEndToEndTests {
         )
         alice._test_handlePacket(forgedPacket, fromPeerID: bob.myPeerID, preseedPeer: false)
 
-        let cached = await TestHelpers.waitUntil(
-            { alice.prekeyBundleStore.hasUsableBundle(for: bob.noiseStaticPublicKeyData()) },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!cached)
+        await alice._test_drainAllPipelines()
+        #expect(!alice.prekeyBundleStore.hasUsableBundle(for: bob.noiseStaticPublicKeyData()))
     }
 
     @Test func verifiedBundleEntersGossipStore() async throws {
-        let alice = makeService()
-        let bob = makeService()
+        let (alice, aliceIdentity) = makeService()
+        let (bob, _) = makeService()
+        authenticateSigningKey(of: bob, in: aliceIdentity)
 
         let bobOut = PacketTap()
         bob._test_onOutboundPacket = bobOut.record
@@ -336,8 +414,9 @@ struct PrekeyEndToEndTests {
     }
 
     @Test func spoofedSenderPrekeyBundleIsRejected() async throws {
-        let alice = makeService()
-        let bob = makeService()
+        let (alice, aliceIdentity) = makeService()
+        let (bob, _) = makeService()
+        authenticateSigningKey(of: bob, in: aliceIdentity)
 
         let bobOut = PacketTap()
         bob._test_onOutboundPacket = bobOut.record
@@ -362,18 +441,16 @@ struct PrekeyEndToEndTests {
         )
         alice._test_handlePacket(spoofed, fromPeerID: PeerID(hexData: fakeSender), preseedPeer: false)
 
-        let cached = await TestHelpers.waitUntil(
-            { alice.prekeyBundleStore.hasUsableBundle(for: bob.noiseStaticPublicKeyData()) },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!cached)
+        await alice._test_drainAllPipelines()
+        #expect(!alice.prekeyBundleStore.hasUsableBundle(for: bob.noiseStaticPublicKeyData()))
         #expect(!alice._test_hasGossipPrekeyBundle(for: bob.myPeerID))
         #expect(!alice._test_hasGossipPrekeyBundle(for: PeerID(hexData: fakeSender)))
     }
 
     @Test func replayedPrekeyBundleWithFreshTimestampIsRejected() async throws {
-        let alice = makeService()
-        let bob = makeService()
+        let (alice, aliceIdentity) = makeService()
+        let (bob, _) = makeService()
+        authenticateSigningKey(of: bob, in: aliceIdentity)
 
         let bobOut = PacketTap()
         bob._test_onOutboundPacket = bobOut.record
@@ -394,11 +471,8 @@ struct PrekeyEndToEndTests {
         )
         alice._test_handlePacket(replay, fromPeerID: bob.myPeerID, preseedPeer: false)
 
-        let cached = await TestHelpers.waitUntil(
-            { alice.prekeyBundleStore.hasUsableBundle(for: bob.noiseStaticPublicKeyData()) },
-            timeout: TestConstants.negativeWaitWindow
-        )
-        #expect(!cached)
+        await alice._test_drainAllPipelines()
+        #expect(!alice.prekeyBundleStore.hasUsableBundle(for: bob.noiseStaticPublicKeyData()))
         #expect(!alice._test_hasGossipPrekeyBundle(for: bob.myPeerID))
     }
 }

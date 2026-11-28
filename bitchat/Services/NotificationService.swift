@@ -15,106 +15,45 @@ import UIKit
 import AppKit
 #endif
 
-protocol NotificationAuthorizing {
-    func requestAuthorization(
-        options: UNAuthorizationOptions,
-        completionHandler: @escaping (Bool, Error?) -> Void
-    )
-}
+final class NotificationService {
+    struct Dependencies {
+        var requestAuthorization: (UNAuthorizationOptions, @escaping (Bool, Error?) -> Void) -> Void
+        var deliver: (UNNotificationRequest) -> Void
+        var setCategories: (Set<UNNotificationCategory>) -> Void
+        var removeAllDelivered: () -> Void
+        var removeAllPending: () -> Void
 
-protocol NotificationRequestDelivering {
-    func add(_ request: UNNotificationRequest)
-}
+        static let noop = Dependencies(
+            requestAuthorization: { _, completion in completion(false, nil) },
+            deliver: { _ in },
+            setCategories: { _ in },
+            removeAllDelivered: {},
+            removeAllPending: {}
+        )
 
-protocol NotificationCategoryRegistering {
-    func setCategories(_ categories: Set<UNNotificationCategory>)
-}
-
-protocol NotificationClearing {
-    func removeAllDeliveredNotifications()
-    func removeAllPendingNotificationRequests()
-}
-
-private final class NotificationCenterAuthorizerAdapter: NotificationAuthorizing {
-    private let center: UNUserNotificationCenter
-
-    init(center: UNUserNotificationCenter) {
-        self.center = center
-    }
-
-    func requestAuthorization(
-        options: UNAuthorizationOptions,
-        completionHandler: @escaping (Bool, Error?) -> Void
-    ) {
-        center.requestAuthorization(options: options, completionHandler: completionHandler)
-    }
-}
-
-private final class NotificationCenterRequestDelivererAdapter: NotificationRequestDelivering {
-    private let center: UNUserNotificationCenter
-
-    init(center: UNUserNotificationCenter) {
-        self.center = center
-    }
-
-    func add(_ request: UNNotificationRequest) {
-        Task {
-            try? await center.add(request)
+        static func system(center: UNUserNotificationCenter = .current()) -> Dependencies {
+            Dependencies(
+                requestAuthorization: { options, completion in
+                    center.requestAuthorization(options: options, completionHandler: completion)
+                },
+                deliver: { request in
+                    Task {
+                        try? await center.add(request)
+                    }
+                },
+                setCategories: { categories in
+                    center.setNotificationCategories(categories)
+                },
+                removeAllDelivered: {
+                    center.removeAllDeliveredNotifications()
+                },
+                removeAllPending: {
+                    center.removeAllPendingNotificationRequests()
+                }
+            )
         }
     }
-}
 
-private final class NotificationCenterCategoryRegistrarAdapter: NotificationCategoryRegistering {
-    private let center: UNUserNotificationCenter
-
-    init(center: UNUserNotificationCenter) {
-        self.center = center
-    }
-
-    func setCategories(_ categories: Set<UNNotificationCategory>) {
-        center.setNotificationCategories(categories)
-    }
-}
-
-private final class NotificationCenterClearerAdapter: NotificationClearing {
-    private let center: UNUserNotificationCenter
-
-    init(center: UNUserNotificationCenter) {
-        self.center = center
-    }
-
-    func removeAllDeliveredNotifications() {
-        center.removeAllDeliveredNotifications()
-    }
-
-    func removeAllPendingNotificationRequests() {
-        center.removeAllPendingNotificationRequests()
-    }
-}
-
-private struct NoopNotificationAuthorizer: NotificationAuthorizing {
-    func requestAuthorization(
-        options: UNAuthorizationOptions,
-        completionHandler: @escaping (Bool, Error?) -> Void
-    ) {
-        completionHandler(false, nil)
-    }
-}
-
-private struct NoopNotificationRequestDeliverer: NotificationRequestDelivering {
-    func add(_ request: UNNotificationRequest) {}
-}
-
-private struct NoopNotificationCategoryRegistrar: NotificationCategoryRegistering {
-    func setCategories(_ categories: Set<UNNotificationCategory>) {}
-}
-
-private struct NoopNotificationClearer: NotificationClearing {
-    func removeAllDeliveredNotifications() {}
-    func removeAllPendingNotificationRequests() {}
-}
-
-final class NotificationService {
     static let shared = NotificationService()
 
     /// Category for the "bitchatters nearby" notification, carrying the wave quick action.
@@ -134,6 +73,9 @@ final class NotificationService {
         static var geohashActivityTitle: String {
             String(localized: "notification.redacted.geohash.title", defaultValue: "📍 new activity nearby", comment: "Lock-screen notification title for activity in a location channel when message previews are hidden; deliberately omits the geohash")
         }
+        static var verificationTitle: String {
+            String(localized: "notification.redacted.verification.title", defaultValue: "✅ peer verified", comment: "Lock-screen notification title for peer verification when message previews are hidden; deliberately omits the peer nickname")
+        }
         static var body: String {
             String(localized: "notification.redacted.body", defaultValue: "open bitchat to read", comment: "Lock-screen notification body shown in place of the message text when message previews are hidden")
         }
@@ -151,10 +93,7 @@ final class NotificationService {
     }
 
     private let isRunningTestsProvider: () -> Bool
-    private let authorizer: NotificationAuthorizing
-    private let requestDeliverer: NotificationRequestDelivering
-    private let categoryRegistrar: NotificationCategoryRegistering
-    private let notificationClearer: NotificationClearing
+    private let dependencies: Dependencies
 
     /// Returns true if running in test environment (XCTest, Swift Testing, or CI)
     private var isRunningTests: Bool {
@@ -163,41 +102,17 @@ final class NotificationService {
 
     private init() {
         self.hidePreviewsProvider = { NotificationPrivacySettings.hideMessagePreviews }
-        self.isRunningTestsProvider = {
-            let env = ProcessInfo.processInfo.environment
-            return NSClassFromString("XCTestCase") != nil ||
-                   env["XCTestConfigurationFilePath"] != nil ||
-                   env["XCTestBundlePath"] != nil ||
-                   env["GITHUB_ACTIONS"] != nil ||
-                   env["CI"] != nil
-        }
-        if isRunningTestsProvider() {
-            self.authorizer = NoopNotificationAuthorizer()
-            self.requestDeliverer = NoopNotificationRequestDeliverer()
-            self.categoryRegistrar = NoopNotificationCategoryRegistrar()
-            self.notificationClearer = NoopNotificationClearer()
-        } else {
-            let center = UNUserNotificationCenter.current()
-            self.authorizer = NotificationCenterAuthorizerAdapter(center: center)
-            self.requestDeliverer = NotificationCenterRequestDelivererAdapter(center: center)
-            self.categoryRegistrar = NotificationCenterCategoryRegistrarAdapter(center: center)
-            self.notificationClearer = NotificationCenterClearerAdapter(center: center)
-        }
+        self.isRunningTestsProvider = { TestEnvironment.isRunningTests }
+        self.dependencies = TestEnvironment.isRunningTests ? .noop : .system()
     }
 
     internal init(
-        isRunningTestsProvider: @escaping () -> Bool,
-        authorizer: NotificationAuthorizing,
-        requestDeliverer: NotificationRequestDelivering,
-        categoryRegistrar: NotificationCategoryRegistering = NoopNotificationCategoryRegistrar(),
-        notificationClearer: NotificationClearing = NoopNotificationClearer(),
+        isRunningTestsProvider: @escaping () -> Bool = { TestEnvironment.isRunningTests },
+        dependencies: Dependencies = .noop,
         hidePreviewsProvider: @escaping () -> Bool = { NotificationPrivacySettings.hideMessagePreviews }
     ) {
         self.isRunningTestsProvider = isRunningTestsProvider
-        self.authorizer = authorizer
-        self.requestDeliverer = requestDeliverer
-        self.categoryRegistrar = categoryRegistrar
-        self.notificationClearer = notificationClearer
+        self.dependencies = dependencies
         self.hidePreviewsProvider = hidePreviewsProvider
     }
 
@@ -206,20 +121,14 @@ final class NotificationService {
     /// cannot linger on a seized device after a wipe.
     func clearAllNotificationsForPanic() {
         guard !isRunningTests else { return }
-        notificationClearer.removeAllPendingNotificationRequests()
-        notificationClearer.removeAllDeliveredNotifications()
+        dependencies.removeAllPending()
+        dependencies.removeAllDelivered()
     }
 
     func requestAuthorization() {
         guard !isRunningTests else { return }
         registerCategories()
-        authorizer.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
-            if granted {
-                // Permission granted
-            } else {
-                // Permission denied
-            }
-        }
+        dependencies.requestAuthorization([.alert, .sound, .badge]) { _, _ in }
     }
 
     private func registerCategories() {
@@ -234,9 +143,9 @@ final class NotificationService {
             intentIdentifiers: [],
             options: []
         )
-        categoryRegistrar.setCategories([nearby])
+        dependencies.setCategories([nearby])
     }
-    
+
     func sendLocalNotification(
         title: String,
         body: String,
@@ -265,9 +174,9 @@ final class NotificationService {
             trigger: nil // Deliver immediately
         )
 
-        requestDeliverer.add(request)
+        dependencies.deliver(request)
     }
-    
+
     func sendMentionNotification(from sender: String, message: String) {
         let title = hidePreviews ? Redacted.mentionTitle : "🫵 you were mentioned by \(sender)"
         let body = hidePreviews ? Redacted.body : message
@@ -297,6 +206,12 @@ final class NotificationService {
         let deeplink = "bitchat://geohash/\(geohash)"
         let userInfo: [String: Any] = ["deeplink": deeplink]
         sendLocalNotification(title: title, body: body, identifier: identifier, userInfo: userInfo)
+    }
+
+    func sendVerificationNotification(title: String, body: String, identifier: String) {
+        let resolvedTitle = hidePreviews ? Redacted.verificationTitle : title
+        let resolvedBody = hidePreviews ? Redacted.body : body
+        sendLocalNotification(title: resolvedTitle, body: resolvedBody, identifier: identifier)
     }
 
     func sendNetworkAvailableNotification(peerCount: Int) {

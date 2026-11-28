@@ -14,31 +14,19 @@ import UserNotifications
 /// global store made whichever ran second depend on the other's cleanup — which
 /// passed locally and failed in CI.
 struct NotificationRedactionTests {
-    private final class RecordingDeliverer: NotificationRequestDelivering {
+    private final class RecordingDeliverer {
         var requests: [UNNotificationRequest] = []
-
-        func add(_ request: UNNotificationRequest) {
-            requests.append(request)
-        }
-    }
-
-    private struct StubAuthorizer: NotificationAuthorizing {
-        func requestAuthorization(
-            options: UNAuthorizationOptions,
-            completionHandler: @escaping (Bool, Error?) -> Void
-        ) {
-            completionHandler(true, nil)
-        }
     }
 
     private func makeService(
         hidePreviews: Bool
     ) -> (NotificationService, RecordingDeliverer) {
         let deliverer = RecordingDeliverer()
+        var deps = NotificationService.Dependencies.noop
+        deps.deliver = { deliverer.requests.append($0) }
         let service = NotificationService(
             isRunningTestsProvider: { false },
-            authorizer: StubAuthorizer(),
-            requestDeliverer: deliverer,
+            dependencies: deps,
             hidePreviewsProvider: { hidePreviews }
         )
         return (service, deliverer)
@@ -126,5 +114,35 @@ struct NotificationRedactionTests {
         let geo = deliverer.requests[1].content
         #expect(geo.title.contains("u4pruyd"))
         #expect(geo.body == "someone said something")
+    }
+
+    @Test func redactedVerificationWithholdsPeerNickname() throws {
+        let (service, deliverer) = makeService(hidePreviews: true)
+
+        service.sendVerificationNotification(
+            title: "Mutual verification",
+            body: "You and alice verified each other",
+            identifier: "verify-mutual-1"
+        )
+
+        let content = try #require(deliverer.requests.first).content
+        #expect(!content.title.contains("alice"))
+        #expect(!content.body.contains("alice"))
+        #expect(!content.title.isEmpty)
+        #expect(!content.body.isEmpty)
+    }
+
+    @Test func unredactedVerificationShowsPeerNickname() throws {
+        let (service, deliverer) = makeService(hidePreviews: false)
+
+        service.sendVerificationNotification(
+            title: "Mutual verification",
+            body: "You and alice verified each other",
+            identifier: "verify-mutual-2"
+        )
+
+        let content = try #require(deliverer.requests.first).content
+        #expect(content.title == "Mutual verification")
+        #expect(content.body == "You and alice verified each other")
     }
 }

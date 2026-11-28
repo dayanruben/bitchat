@@ -67,13 +67,10 @@ private struct PrivateMediaReconnectRetryCandidate {
 /// testable (see `ChatMediaTransferCoordinatorContextTests`) and makes its
 /// true dependencies explicit.
 @MainActor
-protocol ChatMediaTransferContext: AnyObject {
+protocol ChatMediaTransferContext: ChatIdentityContext {
     // MARK: Composition state
     var canSendMediaInCurrentContext: Bool { get }
     var selectedPrivateChatPeer: PeerID? { get }
-    var nickname: String { get }
-    var myPeerID: PeerID { get }
-    var activeChannel: ChannelID { get }
     func nicknameForPeer(_ peerID: PeerID) -> String
     func currentPublicSender() -> (name: String, peerID: PeerID)
 
@@ -94,8 +91,6 @@ protocol ChatMediaTransferContext: AnyObject {
     /// Surfaces a refused explicit media deletion in the affected chat so a
     /// wedged delete never looks like success.
     func notifyMediaDeletionRefused(messageID: String)
-    /// Signals that message state changed so observers refresh (e.g. `objectWillChange.send()`).
-    func notifyUIChanged()
 
     // MARK: Delivery status & dedup
     func updateMessageDeliveryStatus(_ messageID: String, status: DeliveryStatus)
@@ -311,44 +306,17 @@ extension ChatViewModel: ChatMediaTransferContext {
             return
         }
         let requestedIDs = Set(messageIDs)
-        let incomingPathReferences = Array(
-            conversations.conversationsByID.values
-                .lazy
-                .flatMap(\.messages)
-                .compactMap { message -> (
-                    messageID: String,
-                    path: String
-                )? in
-                guard self.isIncomingPrivateMessage(message),
-                      let path = self.incomingMediaRelativePath(
-                          for: message
-                      ) else {
-                    return nil
-                }
-                return (message.id, path)
-            }
-        )
-        let ownerIDsByPath = Dictionary(
-            grouping: incomingPathReferences,
-            by: { $0.path }
-        ).mapValues { Set($0.map(\.messageID)) }
-        let protectedPayloadRelativePaths = Set(
-            ownerIDsByPath.compactMap { path, ownerIDs in
-                ownerIDs.isSubset(of: requestedIDs) ? nil : path
-            }
-        )
         var payloadRelativePaths: [String: String] = [:]
-        for reference in incomingPathReferences
-        where requestedIDs.contains(reference.messageID)
-            && ownerIDsByPath[reference.path, default: []]
-                .isSubset(of: requestedIDs) {
-            payloadRelativePaths[reference.messageID] = reference.path
+        for message in conversations.conversationsByID.values.lazy.flatMap(\.messages)
+        where requestedIDs.contains(message.id)
+            && isIncomingPrivateMessage(message) {
+            if let path = incomingMediaRelativePath(for: message) {
+                payloadRelativePaths[message.id] = path
+            }
         }
         persistence.persistDeletedPrivateMedia(
             messageIDs: messageIDs,
             payloadRelativePaths: payloadRelativePaths,
-            protectedPayloadRelativePaths:
-                protectedPayloadRelativePaths,
             completion: completion
         )
     }
@@ -547,15 +515,29 @@ final class ChatMediaTransferCoordinator {
         self.transferIDFactory = transferIDFactory
     }
 
-    func sendVoiceNote(at url: URL) {
-        guard context.canSendMediaInCurrentContext else {
-            SecureLogger.info("Voice note blocked outside mesh/private context", category: .session)
-            try? FileManager.default.removeItem(at: url)
-            context.addSystemMessage(String(localized: "Voice notes are only available in mesh chats.", comment: "System message when a voice note is attempted outside mesh chats"))
-            return
+    func sendVoiceNote(at url: URL, target: VoiceNoteTarget? = nil) {
+        let targetPeer: PeerID?
+        switch target {
+        case .privateChat(let peerID):
+            guard !peerID.isGeoDM, !peerID.isGeoChat, !peerID.isGroup else {
+                SecureLogger.info("Voice note blocked outside mesh/private context", category: .session)
+                try? FileManager.default.removeItem(at: url)
+                context.addSystemMessage(String(localized: "Voice notes are only available in mesh chats.", comment: "System message when a voice note is attempted outside mesh chats"))
+                return
+            }
+            targetPeer = peerID
+        case .publicMesh:
+            targetPeer = nil
+        case nil:
+            guard context.canSendMediaInCurrentContext else {
+                SecureLogger.info("Voice note blocked outside mesh/private context", category: .session)
+                try? FileManager.default.removeItem(at: url)
+                context.addSystemMessage(String(localized: "Voice notes are only available in mesh chats.", comment: "System message when a voice note is attempted outside mesh chats"))
+                return
+            }
+            targetPeer = context.selectedPrivateChatPeer
         }
 
-        let targetPeer = context.selectedPrivateChatPeer
         let privateMessageID = targetPeer.flatMap { peerID in
             PrivateMediaMessageIdentity.stableID(
                 senderPeerID: context.myPeerID,
@@ -700,6 +682,7 @@ final class ChatMediaTransferCoordinator {
         let prepareImagePacket = self.prepareImagePacket
         let barrier = imagePreparationBarrier
         Task.detached(priority: .userInitiated) { [weak self, barrier] in
+            defer { cleanup?() }
             do {
                 let prepared = try await runBlockingMediaPreparation {
                     try barrier.performIfCurrent(
@@ -812,7 +795,6 @@ final class ChatMediaTransferCoordinator {
 
         let key = context.normalizedContentKey(message.content)
         context.recordContentKey(key, timestamp: timestamp)
-        context.notifyUIChanged()
         return message
     }
 
@@ -1102,17 +1084,6 @@ final class ChatMediaTransferCoordinator {
         cleanupLocalFile(
             forMessage: message,
             directions: ["outgoing"],
-            searchAllCategories: false
-        )
-    }
-
-    /// Receiver cleanup runs only after any required tombstone commit. Keep it
-    /// scoped to the parsed media category and incoming directory so unrelated
-    /// outgoing or cross-category payloads with the same basename survive.
-    func cleanupIncomingLocalFile(forMessage message: BitchatMessage) {
-        cleanupLocalFile(
-            forMessage: message,
-            directions: ["incoming"],
             searchAllCategories: false
         )
     }

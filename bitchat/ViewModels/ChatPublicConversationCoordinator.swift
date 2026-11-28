@@ -18,20 +18,17 @@ import UIKit
 /// conversation stores, geohash participants, and the inbound public message
 /// pipeline.
 @MainActor
-protocol ChatPublicConversationContext: AnyObject {
+protocol ChatPublicConversationContext: ChatIdentityContext {
     // MARK: Channel state
-    var activeChannel: ChannelID { get }
     var currentGeohash: String? { get }
-    var nickname: String { get }
-    var myPeerID: PeerID { get }
-    /// Signals that message state changed so observers refresh (e.g. `objectWillChange.send()`).
-    func notifyUIChanged()
 
     // MARK: Public conversation store (single-writer intents)
     /// Appends a public message in timestamp order. Returns `false` when a
     /// message with the same ID is already in that conversation.
     @discardableResult
     func appendPublicMessage(_ message: BitchatMessage, to conversationID: ConversationID) -> Bool
+    @discardableResult
+    func appendPublicMessages(_ messages: [BitchatMessage], to conversationID: ConversationID) -> [BitchatMessage]
     func publicConversationContainsMessage(withID messageID: String, in conversationID: ConversationID) -> Bool
     /// Removes a message by ID from whichever public conversation contains it.
     @discardableResult
@@ -78,9 +75,7 @@ protocol ChatPublicConversationContext: AnyObject {
     // MARK: Inbound public message processing
     func processActionMessage(_ message: BitchatMessage) -> BitchatMessage
     func isMessageBlocked(_ message: BitchatMessage) -> Bool
-    /// `powBits` is the validated NIP-13 difficulty of the source Nostr event
-    /// (0 for mesh messages); sufficient PoW relaxes the per-sender bucket.
-    func allowPublicMessage(senderKey: String, contentKey: String, powBits: Int) -> Bool
+    func allowPublicMessage(senderKey: String, contentKey: String) -> Bool
     /// Buffers a visible-channel message for the batched (~80 ms) pipeline
     /// flush, which commits it to `conversationID` in the store.
     func enqueuePublicMessage(_ message: BitchatMessage, to conversationID: ConversationID)
@@ -96,6 +91,13 @@ protocol ChatPublicConversationContext: AnyObject {
     // MARK: Notifications
     /// Posts the you-were-mentioned local notification.
     func notifyMention(from sender: String, message: String)
+}
+
+extension ChatPublicConversationContext {
+    @discardableResult
+    func appendPublicMessages(_ messages: [BitchatMessage], to conversationID: ConversationID) -> [BitchatMessage] {
+        messages.filter { appendPublicMessage($0, to: conversationID) }
+    }
 }
 
 extension ChatViewModel: ChatPublicConversationContext {
@@ -134,8 +136,8 @@ extension ChatViewModel: ChatPublicConversationContext {
         meshService.sendMessage(content, mentions: mentions, messageID: messageID, timestamp: timestamp)
     }
 
-    func allowPublicMessage(senderKey: String, contentKey: String, powBits: Int) -> Bool {
-        publicRateLimiter.allow(senderKey: senderKey, contentKey: contentKey, powBits: powBits)
+    func allowPublicMessage(senderKey: String, contentKey: String) -> Bool {
+        publicRateLimiter.allow(senderKey: senderKey, contentKey: contentKey)
     }
 
     func enqueuePublicMessage(_ message: BitchatMessage, to conversationID: ConversationID) {
@@ -156,6 +158,7 @@ extension ChatViewModel: ChatPublicConversationContext {
 
     func prewarmMessageFormatting(_ message: BitchatMessage) {
         _ = formatMessageAsText(message, colorScheme: currentColorScheme)
+        _ = message.contentScan
     }
 
     func notifyMention(from sender: String, message: String) {
@@ -284,7 +287,6 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
             context.cleanupLocalFile(forMessage: removedMessage)
         }
 
-        context.notifyUIChanged()
     }
 
     func clearCurrentPublicTimeline() {
@@ -307,11 +309,6 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
         guard !TestEnvironment.isRunningTests else { return }
 
         Task.detached(priority: .utility) {
-            // Skipped under tests: the test process shares the user's real
-            // ~/Library/Application Support/files tree, and this detached
-            // wipe fires at a nondeterministic time — racing tests that
-            // write media there (see the same guard in panicClearAllData).
-            guard !TestEnvironment.isRunningTests else { return }
             do {
                 let base = try FileManager.default.url(
                     for: .applicationSupportDirectory,
@@ -388,7 +385,7 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
                 guard let context else { return }
                 do {
                     let identity = try context.deriveNostrIdentity(forGeohash: channel.geohash)
-                    let event = try await NostrProtocol.createMinedEphemeralGeohashEvent(
+                    let event = try NostrProtocol.createEphemeralGeohashEvent(
                         content: content,
                         geohash: channel.geohash,
                         senderIdentity: identity,
@@ -444,7 +441,7 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
         return "\(senderPeerID?.id ?? "")|\(msKey)|\(content)"
     }
 
-    func handlePublicMessage(_ message: BitchatMessage, powBits: Int = 0) {
+    func handlePublicMessage(_ message: BitchatMessage) {
         let finalMessage = context.processActionMessage(message)
         if context.isMessageBlocked(finalMessage) { return }
 
@@ -454,7 +451,7 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
         if shouldRateLimit {
             let senderKey = normalizedSenderKey(for: finalMessage)
             let contentKey = context.normalizedContentKey(finalMessage.content)
-            if !context.allowPublicMessage(senderKey: senderKey, contentKey: contentKey, powBits: powBits) {
+            if !context.allowPublicMessage(senderKey: senderKey, contentKey: contentKey) {
                 return
             }
         }
@@ -463,7 +460,7 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
         // Empty content never rendered before (the old visible-array enqueue
         // filtered it); with the store as the sole timeline it is dropped
         // outright instead of lingering invisibly in a backing buffer.
-        guard !finalMessage.content.trimmed.isEmpty else { return }
+        guard finalMessage.content.hasNonWhitespaceContent else { return }
 
         // Resolve the destination conversation. System messages surface on
         // the active channel (matching their old visible-only routing); geo
@@ -511,6 +508,7 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
     }
 
     func checkForMentions(_ message: BitchatMessage) {
+        guard let mentions = message.mentions, !mentions.isEmpty else { return }
         let myNickname = context.nickname.normalizedNickname
         var myTokens: Set<String> = [myNickname]
         let meshPeers = context.meshPeerNicknames()
@@ -519,7 +517,7 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
             let suffix = "#" + String(context.myPeerID.id.prefix(4))
             myTokens = [myNickname + suffix]
         }
-        let isMentioned = message.mentions?.contains { myTokens.contains($0.normalizedNickname) } ?? false
+        let isMentioned = mentions.contains { myTokens.contains($0.normalizedNickname) }
 
         if isMentioned && !isOwnMessage(message) {
             SecureLogger.info("🔔 Mention from \(message.sender)", category: .session)
@@ -530,6 +528,11 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
     func sendHapticFeedback(for message: BitchatMessage) {
         #if os(iOS)
         guard UIApplication.shared.applicationState == .active else { return }
+        // Fast reject: almost no message is a hug or slap action; avoid
+        // geohash identity lookup and token allocations on ordinary chat traffic.
+        let hasHugEmoji = message.content.contains("🫂")
+        let hasSlapEmoji = message.content.contains("🐟")
+        guard hasHugEmoji || hasSlapEmoji else { return }
 
         var tokens: [String] = [context.nickname]
         switch context.activeChannel {
@@ -541,10 +544,8 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
             break
         }
 
-        let hugsMe = tokens.contains { message.content.contains("hugs \($0)") } || message.content.contains("hugs you")
-        let slapsMe = tokens.contains { message.content.contains("slaps \($0) around") } || message.content.contains("slaps you around")
-        let isHugForMe = message.content.contains("🫂") && hugsMe
-        let isSlapForMe = message.content.contains("🐟") && slapsMe
+        let isHugForMe = hasHugEmoji && (tokens.contains { message.content.contains("hugs \($0)") } || message.content.contains("hugs you"))
+        let isSlapForMe = hasSlapEmoji && (tokens.contains { message.content.contains("slaps \($0) around") } || message.content.contains("slaps you around"))
 
         if isHugForMe && !isOwnMessage(message) {
             let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
@@ -579,6 +580,14 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
 
     func pipeline(_: PublicMessagePipeline, commit message: BitchatMessage, to conversationID: ConversationID) -> Bool {
         context.appendPublicMessage(message, to: conversationID)
+    }
+
+    func pipeline(
+        _: PublicMessagePipeline,
+        commitBatch messages: [BitchatMessage],
+        to conversationID: ConversationID
+    ) -> [BitchatMessage] {
+        context.appendPublicMessages(messages, to: conversationID)
     }
 
     func pipelinePrewarmMessage(_: PublicMessagePipeline, message: BitchatMessage) {

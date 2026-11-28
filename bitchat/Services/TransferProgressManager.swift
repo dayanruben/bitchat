@@ -61,6 +61,15 @@ final class TransferProgressManager {
         }
     }
 
+    /// Panic-wipe hook: synchronously removes all in-flight transfer entries
+    /// so no transfer IDs remain in memory after panic completion.
+    func resetForPanic() {
+        queue.sync(flags: .barrier) {
+            self.states.removeAll(keepingCapacity: false)
+        }
+    }
+
+    #if DEBUG
     func snapshot(id: String) -> (sent: Int, total: Int)? {
         var result: (sent: Int, total: Int)?
         queue.sync {
@@ -68,4 +77,5 @@ final class TransferProgressManager {
         }
         return result
     }
+    #endif
 }

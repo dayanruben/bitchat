@@ -25,7 +25,6 @@ struct AppInfoView: View {
     @State private var customRelays = NostrRelaySettings.customRelays()
     @State private var relayInput = ""
     @State private var relayError: String?
-    @ObservedObject private var locationManager = LocationChannelManager.shared
     /// Sticky across opens: first-ever open lands on Info (the gentler
     /// introduction), and afterwards the sheet reopens wherever it was left.
     @AppStorage(AppInfoView.selectedPaneStorageKey) private var selectedPane: Pane = .info
@@ -60,9 +59,9 @@ struct AppInfoView: View {
 
     // MARK: - Constants
     private enum Strings {
-        static let appName: LocalizedStringKey = "app_info.app_name"
-        static let tagline: LocalizedStringKey = "app_info.tagline"
-        static let appearanceTitle: LocalizedStringKey = "app_info.appearance.title"
+        static let appName = String(localized: "app_info.app_name")
+        static let tagline = String(localized: "app_info.tagline")
+        static let appearanceTitle = String(localized: "app_info.appearance.title")
 
         /// New keys carry their English copy inline (defaultValue) until the
         /// i18n pass lands them in the catalog; moved keys keep their homes.
@@ -87,12 +86,27 @@ struct AppInfoView: View {
                     cell
                 )
             }
+            /// The cell caption plus how many people are across the bridge.
+            /// The count is a plural substitution, so "1 person" and "2 people"
+            /// are separate translations.
+            static func bridgeCell(_ cell: String, people: Int) -> String {
+                String(
+                    format: String(
+                        localized: "app_info.settings.bridge.cell_people",
+                        defaultValue: "rendezvous cell: %1$@ · %2$#@people@",
+                        comment: "Caption under the mesh bridge toggle: the rendezvous cell and a plural count of people across the bridge"
+                    ),
+                    locale: .current,
+                    cell,
+                    people
+                )
+            }
             static let bridgeNoCell = String(localized: "app_info.settings.bridge.no_cell", defaultValue: "no rendezvous cell yet — needs location access or a nearby bridge peer", comment: "Caption under the mesh bridge toggle when the bridge is on but has no geohash cell to meet on")
 
             // Moved from LocationChannelsSheet; keys unchanged. (The former
             // internet-gateway toggle is gone: the bridge switch drives all
             // internet sharing, including geohash-channel gatewaying.)
-            static let torTitle: LocalizedStringKey = "location_channels.tor.title"
+            static let torTitle = String(localized: "location_channels.tor.title")
             // Replaces `location_channels.tor.subtitle`, which described the
             // setting as location-channels-only. It covers private messages and
             // relay-directory refreshes too, and said nothing about the cost of
@@ -101,7 +115,7 @@ struct AppInfoView: View {
             static let torOffWarning = String(localized: "app_info.settings.tor.off_warning", defaultValue: "tor is off: every relay you connect to can see your IP address, including relays carrying your private messages.", comment: "Warning shown under the tor toggle while tor is switched off, stating that relay operators can see the device IP address")
 
             static let relaysTitle = String(localized: "app_info.settings.relays.title", defaultValue: "private message relays", comment: "Title of the relay list editor in settings")
-            static let relaysSubtitle = String(localized: "app_info.settings.relays.subtitle", defaultValue: "when the mesh can't reach someone, private messages travel through these relays. the built-in ones are well-known addresses that a network filter can block, so you can add your own — including .onion addresses.", comment: "Subtitle explaining what the relay list is for and why someone would add a relay")
+            static let relaysSubtitle = String(localized: "app_info.settings.relays.subtitle", defaultValue: "when the mesh can't reach someone, private messages travel through these relays. the built-in ones are well-known addresses that a network filter can block, so you can add your own.", comment: "Subtitle explaining what the relay list is for and why someone would add a relay")
             static let relayBuiltIn = String(localized: "app_info.settings.relays.built_in", defaultValue: "built in", comment: "Label marking a relay as one of the built-in relays, which cannot be removed")
             static let relayPlaceholder = String(localized: "app_info.settings.relays.placeholder", defaultValue: "wss://relay.example.com", comment: "Placeholder text in the field for adding a relay address")
             static let relayAdd = String(localized: "app_info.settings.relays.add", defaultValue: "add", comment: "Button that adds the typed relay address to the list")
@@ -121,8 +135,8 @@ struct AppInfoView: View {
                     )
                 }
             }
-            static let toggleOn: LocalizedStringKey = "common.toggle.on"
-            static let toggleOff: LocalizedStringKey = "common.toggle.off"
+            static let toggleOn = String(localized: "common.toggle.on")
+            static let toggleOff = String(localized: "common.toggle.off")
 
             static let privacyTitle = String(localized: "app_info.settings.privacy.title", defaultValue: "PRIVACY", comment: "Section header (uppercase) for privacy settings such as hiding notification previews")
             static let hidePreviewsTitle = String(localized: "app_info.settings.hide_previews.title", defaultValue: "hide message previews", comment: "Title of the setting that keeps message text, sender names, and geohashes out of lock-screen notifications")
@@ -136,7 +150,7 @@ struct AppInfoView: View {
         }
 
         enum Features {
-            static let title: LocalizedStringKey = "app_info.features.title"
+            static let title = String(localized: "app_info.features.title")
             static let offlineComm = AppInfoFeatureInfo(
                 icon: "wifi.slash",
                 title: "app_info.features.offline.title",
@@ -175,7 +189,7 @@ struct AppInfoView: View {
         }
 
         enum Legend {
-            static let title: LocalizedStringKey = "app_info.legend.title"
+            static let title = String(localized: "app_info.legend.title")
             /// Every glyph the peer lists and headers use, in one place —
             /// nothing else in the app defines them. A nil color renders in
             /// the theme's primary text color.
@@ -197,7 +211,7 @@ struct AppInfoView: View {
         }
 
         enum Voice {
-            static let title: LocalizedStringKey = "app_info.voice.title"
+            static let title = String(localized: "app_info.voice.title")
             // The live-voice title/description keys are referenced inline at
             // the toggle (they ride the shared settingToggle now).
         }
@@ -211,7 +225,7 @@ struct AppInfoView: View {
         }
 
         enum Network {
-            static let title: LocalizedStringKey = "app_info.network.title"
+            static let title = String(localized: "app_info.network.title")
             static let topology = AppInfoFeatureInfo(
                 icon: "point.3.connected.trianglepath.dotted",
                 title: "app_info.network.topology.title",
@@ -220,7 +234,7 @@ struct AppInfoView: View {
         }
 
         enum Privacy {
-            static let title: LocalizedStringKey = "app_info.privacy.title"
+            static let title = String(localized: "app_info.privacy.title")
             static let noTracking = AppInfoFeatureInfo(
                 icon: "eye.slash",
                 title: "app_info.privacy.no_tracking.title",
@@ -239,7 +253,7 @@ struct AppInfoView: View {
         }
 
         enum HowToUse {
-            static let title: LocalizedStringKey = "app_info.how_to_use.title"
+            static let title = String(localized: "app_info.how_to_use.title")
             /// The instruction strings flowed into one comma-separated
             /// paragraph. The translations carry their legacy bullet-list
             /// prefix ("• "), so it is stripped here.
@@ -259,60 +273,54 @@ struct AppInfoView: View {
 
     }
 
-    var body: some View {
-        #if os(macOS)
+    private var sheetBody: some View {
         VStack(spacing: 0) {
-            // Custom header for macOS
-            HStack {
-                Spacer()
-                Button("app_info.done") {
-                    dismiss()
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(textColor)
-                .padding()
-            }
-            .themedSurface(opacity: 0.95)
+            panePicker
 
-            VStack(spacing: 0) {
-                panePicker
-
-                ScrollView {
-                    paneContent
-                }
+            ScrollView {
+                paneContent
             }
-            .themedSheetBackground()
         }
-        .frame(width: 600, height: 700)
+        .themedSheetBackground()
+    }
+
+    var body: some View {
+        Group {
+            #if os(macOS)
+            VStack(spacing: 0) {
+                // Custom header for macOS
+                HStack {
+                    Spacer()
+                    Button(String(localized: "app_info.done")) {
+                        dismiss()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(textColor)
+                    .padding()
+                }
+                .themedSurface(opacity: 0.95)
+
+                sheetBody
+            }
+            .frame(width: 600, height: 700)
+            #else
+            NavigationView {
+                sheetBody
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            SheetCloseButton { dismiss() }
+                                .foregroundColor(textColor)
+                        }
+                    }
+            }
+            #endif
+        }
         .sheet(isPresented: $showTopology) {
             if let topologyProvider {
                 MeshTopologyView(provider: topologyProvider)
             }
         }
-        #else
-        NavigationView {
-            VStack(spacing: 0) {
-                panePicker
-
-                ScrollView {
-                    paneContent
-                }
-            }
-            .themedSheetBackground()
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    SheetCloseButton { dismiss() }
-                        .foregroundColor(textColor)
-                }
-            }
-        }
-        .sheet(isPresented: $showTopology) {
-            if let topologyProvider {
-                MeshTopologyView(provider: topologyProvider)
-            }
-        }
-        #endif
     }
 
     // MARK: - Pane switching
@@ -419,8 +427,8 @@ struct AppInfoView: View {
 
                 settingsCard {
                     settingToggle(
-                        title: Text("app_info.voice.live.title"),
-                        subtitle: Text("app_info.voice.live.description"),
+                        title: Text(String(localized: "app_info.voice.live.title")),
+                        subtitle: Text(String(localized: "app_info.voice.live.description")),
                         isOn: Binding(
                             get: { liveVoiceEnabled },
                             set: { newValue in
@@ -446,7 +454,7 @@ struct AppInfoView: View {
                     // a hint about why there isn't one yet (no location and no
                     // bridge peer advertising a cell).
                     if bridgeService.isEnabled {
-                        Text(bridgeService.activeCell.map(Strings.Settings.bridgeCell) ?? Strings.Settings.bridgeNoCell)
+                        Text(bridgeCaption)
                             .bitchatFont(size: 11)
                             .foregroundColor(secondaryTextColor)
                     }
@@ -485,7 +493,7 @@ struct AppInfoView: View {
                                 locationNotesEnabled = newValue
                                 LocationNotesSettings.enabled = newValue
                                 if newValue {
-                                    locationManager.enableLocationChannels()
+                                    locationChannelsModel.enableLocationChannels()
                                 }
                             }
                         )
@@ -500,7 +508,7 @@ struct AppInfoView: View {
                 switch locationChannelsModel.permissionState {
                 case .authorized:
                     Button(action: SystemSettings.location.open) {
-                        Text("location_channels.action.remove_access")
+                        Text(String(localized: "location_channels.action.remove_access"))
                             .bitchatFont(size: 12)
                             .foregroundColor(palette.alertRed)
                             .frame(maxWidth: .infinity)
@@ -511,7 +519,7 @@ struct AppInfoView: View {
                     .buttonStyle(.plain)
                 case .notDetermined:
                     Button(action: { locationChannelsModel.enableLocationChannels() }) {
-                        Text("location_channels.action.request_permissions")
+                        Text(String(localized: "location_channels.action.request_permissions"))
                             .bitchatFont(size: 12)
                             .foregroundColor(palette.accent)
                             .frame(maxWidth: .infinity)
@@ -522,10 +530,10 @@ struct AppInfoView: View {
                     .buttonStyle(.plain)
                 case .denied, .restricted:
                     settingsCard {
-                        Text("location_channels.permission_denied")
+                        Text(String(localized: "location_channels.permission_denied"))
                             .bitchatFont(size: 11)
                             .foregroundColor(secondaryTextColor)
-                        Button("location_channels.action.open_settings", action: SystemSettings.location.open)
+                        Button(String(localized: "location_channels.action.open_settings"), action: SystemSettings.location.open)
                             .buttonStyle(.plain)
                             .bitchatFont(size: 12)
                             .foregroundColor(palette.accent)
@@ -576,7 +584,7 @@ struct AppInfoView: View {
                         Button(Strings.Settings.panicConfirmAction, role: .destructive) {
                             onPanicWipe?()
                         }
-                        Button("common.cancel", role: .cancel) {}
+                        Button(String(localized: "common.cancel"), role: .cancel) {}
                     }
 
                     Text(Strings.Settings.panicNote)
@@ -604,6 +612,23 @@ struct AppInfoView: View {
             if isSelected {
                 Image(systemName: "checkmark")
             }
+        }
+    }
+
+    /// The line under the mesh bridge toggle. A live cell keeps the existing
+    /// caption, and adds the bridged-people count only when someone is there.
+    private var bridgeCaption: String {
+        let people = bridgeService.bridgedPeerCount
+        switch BridgeSettingsCaption.resolve(
+            hasCell: bridgeService.activeCell != nil,
+            people: people
+        ) {
+        case .noCell:
+            return Strings.Settings.bridgeNoCell
+        case .cell:
+            return Strings.Settings.bridgeCell(bridgeService.activeCell ?? "")
+        case .cellAndPeople:
+            return Strings.Settings.bridgeCell(bridgeService.activeCell ?? "", people: people)
         }
     }
 
@@ -793,7 +818,7 @@ struct AppInfoView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityHint(Text("app_info.network.topology.hint"))
+                    .accessibilityHint(Text(String(localized: "app_info.network.topology.hint")))
                 }
             }
 
@@ -859,10 +884,10 @@ struct AppInfoFeatureInfo {
     let description: Text
 
     /// Catalog-backed strings (existing keys).
-    init(icon: String, title: LocalizedStringKey, description: LocalizedStringKey) {
+    init(icon: String, title: StaticString, description: StaticString) {
         self.icon = icon
-        self.title = Text(title)
-        self.description = Text(description)
+        self.title = Text(String(localized: title))
+        self.description = Text(String(localized: description))
     }
 
     /// Pre-resolved strings — new keys that carry their English defaultValue
@@ -880,7 +905,7 @@ struct SectionHeader: View {
 
     private var textColor: Color { palette.primary }
 
-    init(_ title: LocalizedStringKey) {
+    init(_ title: String) {
         self.title = Text(title)
     }
 

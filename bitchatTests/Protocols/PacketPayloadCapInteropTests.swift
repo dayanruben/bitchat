@@ -25,7 +25,7 @@ struct PacketPayloadCapInteropTests {
         // BLEService.sendMessage, Android MeshCore.sendMessage), so these
         // composer-sized messages are as large as the type legitimately gets.
         let cjk = String(repeating: "漢字仮名交じり文", count: 2_000)
-        let ascii = String(repeating: "x", count: InputValidator.Limits.maxMessageLength)
+        let ascii = String(repeating: "x", count: TransportConfig.maxMessageLength)
         #expect(cjk.count == 16_000)
         for content in [cjk, ascii] {
             let packet = makePacket(type: .message, payload: Data(content.utf8))
@@ -33,6 +33,22 @@ struct PacketPayloadCapInteropTests {
         }
 
         #expect(BinaryProtocol.decode(try inflatedFrame(type: .message)) == nil)
+    }
+
+    @Test func privateMessageOver255UTF8BytesDoesNotEncode() {
+        let within = String(repeating: "é", count: 127)
+        #expect(within.utf8.count == 254)
+        #expect(PrivateMessagePacket.contentFitsOnWire(within))
+        #expect(PrivateMessagePacket(messageID: "m", content: within).encode() != nil)
+
+        let over = String(repeating: "é", count: 128)
+        #expect(over.utf8.count == 256)
+        #expect(PrivateMessagePacket.contentFitsOnWire(over) == false)
+        #expect(PrivateMessagePacket(messageID: "m", content: over).encode() == nil)
+
+        let ascii = String(repeating: "x", count: PrivateMessagePacket.maxContentUTF8Bytes)
+        #expect(PrivateMessagePacket(messageID: "m", content: ascii).encode() != nil)
+        #expect(PrivateMessagePacket(messageID: "m", content: ascii + "y").encode() == nil)
     }
 
     @Test func androidAndIOSSizedFragmentsStillDecode() throws {
@@ -111,10 +127,19 @@ struct PacketPayloadCapInteropTests {
     }
 
     @Test func largeFileTransfersStillDecode() throws {
-        // A 1 MiB image whose bytes compress well: the largest legitimate
-        // inflation a broadcast file can ask for.
+        // A 1 MiB file with realistic compressibility (~3-5x ratio): compresses
+        // on wire without resembling a ~1000x decompression bomb.
         var content = Data([0xFF, 0xD8, 0xFF, 0xE0])
-        content.append(Data(count: FileTransferLimits.maxPayloadBytes - content.count))
+        var rng: UInt64 = 0x1234_5678_9ABC_DEF0
+        content.reserveCapacity(FileTransferLimits.maxPayloadBytes)
+        for i in content.count..<FileTransferLimits.maxPayloadBytes {
+            if i % 4 == 0 {
+                rng = rng &* 6364136223846793005 &+ 1442695040888963407
+                content.append(UInt8((rng >> 33) & 0x3F))
+            } else {
+                content.append(0)
+            }
+        }
         let file = BitchatFilePacket(fileName: "photo.jpg", fileSize: nil, mimeType: "image/jpeg", content: content)
         let payload = try #require(file.encode())
         let packet = makePacket(type: .fileTransfer, payload: payload, version: 2)
@@ -188,7 +213,7 @@ struct PacketPayloadCapInteropTests {
 
     private func maxGroupMessage() throws -> Data {
         try GroupCrypto.sealMessage(
-            content: String(repeating: "g", count: InputValidator.Limits.maxMessageLength),
+            content: String(repeating: "g", count: TransportConfig.maxMessageLength),
             messageID: UUID().uuidString,
             senderNickname: String(repeating: "n", count: 50),
             senderSigningKey: Data(repeating: 0x51, count: 32),

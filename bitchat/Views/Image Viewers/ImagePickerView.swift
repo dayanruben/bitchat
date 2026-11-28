@@ -15,9 +15,19 @@ struct ImagePickerView: UIViewControllerRepresentable {
     let sourceType: UIImagePickerController.SourceType
     let completion: (UIImage?) -> Void
 
+    static func resolvedSourceType(
+        for requested: UIImagePickerController.SourceType,
+        isAvailable: (UIImagePickerController.SourceType) -> Bool = UIImagePickerController.isSourceTypeAvailable
+    ) -> UIImagePickerController.SourceType {
+        if isAvailable(requested) {
+            return requested
+        }
+        return .photoLibrary
+    }
+
     func makeUIViewController(context: Context) -> UIImagePickerController {
         let picker = UIImagePickerController()
-        picker.sourceType = sourceType
+        picker.sourceType = Self.resolvedSourceType(for: sourceType)
         picker.delegate = context.coordinator
         picker.allowsEditing = false
 
@@ -64,7 +74,7 @@ struct ImagePickerView: UIViewControllerRepresentable {
                 .resizable()
                 .scaledToFit()
         } else {
-            Text(String(localized: "image_picker.none_selected", defaultValue: "no image selected", comment: "Placeholder shown in the image picker before a selection"))
+            Text(verbatim: "no image selected")
         }
         Button("Show") { isPresented = true }
     }

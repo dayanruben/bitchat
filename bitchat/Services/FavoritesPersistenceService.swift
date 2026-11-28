@@ -28,6 +28,11 @@ final class FavoritesPersistenceService: ObservableObject {
     private static let storageKey = "chat.bitchat.favorites"
     private static let keychainService = "chat.bitchat.favorites"
     private let keychain: KeychainManagerProtocol
+    /// True when the initial keychain read failed due to a transient error
+    /// (e.g. locked boot) rather than `.itemNotFound`. While true, `saveFavorites()`
+    /// refuses to overwrite the Keychain with an incomplete in-memory map so
+    /// existing favorites are never clobbered.
+    private var loadUnavailable = false
     
     @Published private(set) var favorites: [Data: FavoriteRelationship] = [:] { // Noise pubkey -> relationship
         didSet { rebuildNostrKeyIndex() }
@@ -40,7 +45,6 @@ final class FavoritesPersistenceService: ObservableObject {
     init(keychain: KeychainManagerProtocol = KeychainManager.makeDefault()) {
         self.keychain = keychain
         loadFavorites()
-        rebuildNostrKeyIndex()
         
         // Update mutual favorites when favorites change
         $favorites
@@ -225,8 +229,8 @@ final class FavoritesPersistenceService: ObservableObject {
     func clearAllFavorites() {
         SecureLogger.warning("🧹 Clearing all favorites (panic mode)", category: .session)
         
+        loadUnavailable = false
         favorites.removeAll()
-        saveFavorites()
         
         // Delete from keychain directly
         keychain.delete(
@@ -241,6 +245,10 @@ final class FavoritesPersistenceService: ObservableObject {
     // MARK: - Persistence
     
     private func saveFavorites() {
+        guard !loadUnavailable else {
+            SecureLogger.warning("⚠️ Skipping favorites save while prior keychain read was unavailable", category: .security)
+            return
+        }
         let relationships = Array(favorites.values)
         // Saving favorite relationships to keychain
         
@@ -264,12 +272,21 @@ final class FavoritesPersistenceService: ObservableObject {
     
     private func loadFavorites() {
         // Loading favorites from keychain
-        
-        guard let data = keychain.load(
+        let data: Data
+        switch keychain.loadWithResult(
             key: Self.storageKey,
             service: Self.keychainService
-        ) else { 
-            return 
+        ) {
+        case .success(let loadedData):
+            loadUnavailable = false
+            data = loadedData
+        case .itemNotFound:
+            loadUnavailable = false
+            return
+        case .deviceLocked, .authenticationFailed, .accessDenied, .otherError:
+            loadUnavailable = true
+            SecureLogger.warning("⚠️ Favorites keychain read unavailable at launch; deferring writes to prevent overwrite", category: .security)
+            return
         }
         
         do {
@@ -285,49 +302,27 @@ final class FavoritesPersistenceService: ObservableObject {
                 }
             }
             
-            // Convert to dictionary, cleaning up duplicates by public key (not nickname)
-            var seenPublicKeys: [Data: FavoriteRelationship] = [:]
-            var cleanedRelationships: [FavoriteRelationship] = []
-            
+            // Build dictionary locally and assign once so `favorites.didSet`
+            // runs `rebuildNostrKeyIndex()` once in O(N) instead of O(N²).
+            var loaded: [Data: FavoriteRelationship] = [:]
+            loaded.reserveCapacity(relationships.count)
+
             for relationship in relationships {
-                // Check for duplicates by public key (the actual unique identifier)
-                if let existing = seenPublicKeys[relationship.peerNoisePublicKey] {
+                if let existing = loaded[relationship.peerNoisePublicKey] {
                     SecureLogger.warning("⚠️ Duplicate favorite found for public key \(relationship.peerNoisePublicKey.hexEncodedString()) - nicknames: '\(existing.peerNickname)' vs '\(relationship.peerNickname)'", category: .session)
-                    
-                    // Keep the most recent or most complete relationship
                     if relationship.lastUpdated > existing.lastUpdated ||
                        (relationship.peerNostrPublicKey != nil && existing.peerNostrPublicKey == nil) {
-                        // Replace with newer/more complete entry
-                        seenPublicKeys[relationship.peerNoisePublicKey] = relationship
-                        cleanedRelationships.removeAll { $0.peerNoisePublicKey == relationship.peerNoisePublicKey }
-                        cleanedRelationships.append(relationship)
+                        loaded[relationship.peerNoisePublicKey] = relationship
                     }
                 } else {
-                    seenPublicKeys[relationship.peerNoisePublicKey] = relationship
-                    cleanedRelationships.append(relationship)
+                    loaded[relationship.peerNoisePublicKey] = relationship
                 }
             }
-            
-            // If we cleaned up duplicates, save the cleaned list
-            if cleanedRelationships.count < relationships.count {
-                // Cleaned up duplicates
-                
-                // Clear and rebuild favorites dictionary
-                favorites.removeAll()
-                for relationship in cleanedRelationships {
-                    favorites[relationship.peerNoisePublicKey] = relationship
-                }
-                
-                // Save cleaned favorites
+
+            favorites = loaded
+            if loaded.count < relationships.count {
                 saveFavorites()
-                
-                // Notify that favorites have been cleaned up (synchronously since we're already on main actor)
                 NotificationCenter.default.post(name: .favoriteStatusChanged, object: nil)
-            } else {
-                // No duplicates, just populate normally
-                for relationship in cleanedRelationships {
-                    favorites[relationship.peerNoisePublicKey] = relationship
-                }
             }
             
             // Log loaded relationships
